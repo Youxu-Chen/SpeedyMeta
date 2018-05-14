@@ -161,8 +161,8 @@ using namespace std;
 
 typedef struct dc_v{
   float score;
-  long offset;
-  int len;
+  size_t len;
+  long long offset;
 }dc_value;
 
 typedef struct feedback_info{

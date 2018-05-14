@@ -10579,7 +10579,16 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
       return -EOPNOTSUPP;
   }
 
-  return _do_setxattr(in, name, value, size, flags, uid, gid);
+  // speedymeta
+  int res;
+  if (strncmp(name, "user.dc.", 8) == 0){
+     // cache xattrs in client buffer
+    corefs_set_xattrs(in, name + 8, size, value);
+    make_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
+  }
+  else
+    res = _do_setxattr(in, name, value, size, flags, uid, gid);
+  return res;
 }
 
 int Client::_setxattr(InodeRef &in, const char *name, const void *value,
