@@ -1220,7 +1220,7 @@ public:
 
   void corefs_print_xattrs(Inode *in);
   void corefs_set_xattrs(Inode *in, string key, uint64_t size, void* value);
-  void corefs_extract_correlations(Inode *in, const char* buf, long offset);
+  // void corefs_extract_correlations(Inode *in, const char* buf, long offset);
 
   virtual const char** get_tracked_conf_keys() const;
   virtual void handle_conf_change(const struct md_config_t *conf,

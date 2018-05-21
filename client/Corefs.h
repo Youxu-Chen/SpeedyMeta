@@ -479,156 +479,156 @@ int Client::correlation_overlap(long offset1, int len1, long offset2, int len2){
   return 0;
 }
 
-void Client::corefs_extract_correlations(Inode *in, const char *buf, long offset){
-  const char* pattern;
-  int start;
-  #ifdef COREFS_SEMANTIC_CODE
-    pattern = "^#include\\s(\"|<)((\\w+(/|_|-)?)+)\\.h(\"|>)$";
-    start = 10;
-  #endif
+// void Client::corefs_extract_correlations(Inode *in, const char *buf, long offset){
+//   const char* pattern;
+//   int start;
+//   #ifdef COREFS_SEMANTIC_CODE
+//     pattern = "^#include\\s(\"|<)((\\w+(/|_|-)?)+)\\.h(\"|>)$";
+//     start = 10;
+//   #endif
 
-  #ifdef COREFS_SRC
-    pattern = "^src=/fileset/(\\w+)$";
-    start = 4;
-  #endif
+//   #ifdef COREFS_SRC
+//     pattern = "^src=/fileset/(\\w+)$";
+//     start = 4;
+//   #endif
 
-  int coursor_char;
-  int num_slash;
-  int dep_path;
-  regex_t reg;
-  regcomp(&reg, pattern, REG_EXTENDED | REG_NEWLINE);
-  // regcomp(&reg, pattern, REG_EXTENDED);
-  const size_t nmatch = 1;
-  regmatch_t pmatch[1];
-  int flag_match = 0;
-  char* data = (char *)buf;
-  // ldout(cct, 2) << "[corefs_prefetch]" << dendl;
-  filepath path_in_long;
-  if(!in)
-    return;
-  in->make_long_path(path_in_long);
-  ldout(cct, 2) << "long path = " << path_in_long << dendl;
+//   int coursor_char;
+//   int num_slash;
+//   int dep_path;
+//   regex_t reg;
+//   regcomp(&reg, pattern, REG_EXTENDED | REG_NEWLINE);
+//   // regcomp(&reg, pattern, REG_EXTENDED);
+//   const size_t nmatch = 1;
+//   regmatch_t pmatch[1];
+//   int flag_match = 0;
+//   char* data = (char *)buf;
+//   // ldout(cct, 2) << "[corefs_prefetch]" << dendl;
+//   filepath path_in_long;
+//   if(!in)
+//     return;
+//   in->make_long_path(path_in_long);
+//   ldout(cct, 2) << "long path = " << path_in_long << dendl;
 
-  char value[20];
-  int score = 1;
-  long corre_offset = 0;
-  long corre_len;
-  long pass = 0;
-  string s_corre;
+//   char value[20];
+//   int score = 1;
+//   long corre_offset = 0;
+//   long corre_len;
+//   long pass = 0;
+//   string s_corre;
 
-  while(!regexec(&reg, data, nmatch, pmatch, 0)){
-    //Matched!
-    flag_match = 1;
-    ldout(cct, 2) << " pattern matched" << dendl;
-    ldout(cct, 2) << " start=" << pmatch[0].rm_so <<", end=" << pmatch[0].rm_eo << dendl;
-    #ifdef COREFS_SEMANTIC_CODE
-    // decrease 11 to exclude other un-correlated chars
-    char *correlation = (char *)malloc(sizeof(char)*(pmatch[0].rm_eo - pmatch[0].rm_so - start));
-    strncpy(correlation, &data[pmatch[0].rm_so + start], pmatch[0].rm_eo - pmatch[0].rm_so - start);
-    correlation[pmatch[0].rm_eo - pmatch[0].rm_so - start - 1] = '\0';
-    ldout(cct, 2) << "corefs.correlation = " << correlation << dendl;
+//   while(!regexec(&reg, data, nmatch, pmatch, 0)){
+//     //Matched!
+//     flag_match = 1;
+//     ldout(cct, 2) << " pattern matched" << dendl;
+//     ldout(cct, 2) << " start=" << pmatch[0].rm_so <<", end=" << pmatch[0].rm_eo << dendl;
+//     #ifdef COREFS_SEMANTIC_CODE
+//     // decrease 11 to exclude other un-correlated chars
+//     char *correlation = (char *)malloc(sizeof(char)*(pmatch[0].rm_eo - pmatch[0].rm_so - start));
+//     strncpy(correlation, &data[pmatch[0].rm_so + start], pmatch[0].rm_eo - pmatch[0].rm_so - start);
+//     correlation[pmatch[0].rm_eo - pmatch[0].rm_so - start - 1] = '\0';
+//     ldout(cct, 2) << "corefs.correlation = " << correlation << dendl;
     
-    coursor_char = 0;
-    num_slash = 0;
-    // while(correlation[coursor_char]!='\0'){
-    //   if(correlation[coursor_char] == '/')
-    //     num_slash++;
-    //   coursor_char++;
-    // }
-    // ldout(cct, 2) << "number of slash =  " << num_slash << dendl;
-    filepath new_corre;
-    if(data[pmatch[0].rm_so + 9] == '<'){
-      // similar as format:#include <linux/fs.h>
-      // add prefix: /linux-4.14.2/include/
-      ldout(cct, 2) << "linux-include" << dendl;
-      new_corre.set_path("/linux-4.14.2/include");
-      new_corre.push_dentry(correlation);
-    }
-    else{
-      ldout(cct, 2) << "client-include" << dendl;
-      dep_path = path_in_long.depth();
-      ldout(cct, 2) << "depth = " << dep_path << dendl;
-      new_corre = path_in_long.prefixpath(dep_path- num_slash - 1);
-      ldout(cct, 2) << "number of prefix in path = " << new_corre << dendl;
-      new_corre.push_dentry(correlation);
-    }
+//     coursor_char = 0;
+//     num_slash = 0;
+//     // while(correlation[coursor_char]!='\0'){
+//     //   if(correlation[coursor_char] == '/')
+//     //     num_slash++;
+//     //   coursor_char++;
+//     // }
+//     // ldout(cct, 2) << "number of slash =  " << num_slash << dendl;
+//     filepath new_corre;
+//     if(data[pmatch[0].rm_so + 9] == '<'){
+//       // similar as format:#include <linux/fs.h>
+//       // add prefix: /linux-4.14.2/include/
+//       ldout(cct, 2) << "linux-include" << dendl;
+//       new_corre.set_path("/linux-4.14.2/include");
+//       new_corre.push_dentry(correlation);
+//     }
+//     else{
+//       ldout(cct, 2) << "client-include" << dendl;
+//       dep_path = path_in_long.depth();
+//       ldout(cct, 2) << "depth = " << dep_path << dendl;
+//       new_corre = path_in_long.prefixpath(dep_path- num_slash - 1);
+//       ldout(cct, 2) << "number of prefix in path = " << new_corre << dendl;
+//       new_corre.push_dentry(correlation);
+//     }
     
-    ldout(cct, 2) << "new correlation = " << new_corre << dendl;
-    ldout(cct, 2) << "new correlation_2 = " << "/"+new_corre.get_path() << dendl;
+//     ldout(cct, 2) << "new correlation = " << new_corre << dendl;
+//     ldout(cct, 2) << "new correlation_2 = " << "/"+new_corre.get_path() << dendl;
 
-    s_corre = "/" + new_corre.get_path();
-    ldout(cct, 2) << "final correlation = " << s_corre << dendl;
-    #endif
+//     s_corre = "/" + new_corre.get_path();
+//     ldout(cct, 2) << "final correlation = " << s_corre << dendl;
+//     #endif
 
-    #ifdef COREFS_SRC
-    char *correlation = (char *)malloc(sizeof(char)*(pmatch[0].rm_eo - pmatch[0].rm_so - start));
-    strncpy(correlation, &data[pmatch[0].rm_so + start], pmatch[0].rm_eo - pmatch[0].rm_so - start + 1);
-    correlation[pmatch[0].rm_eo - pmatch[0].rm_so - start] = '\0';
-    ldout(cct, 2) << "corefs.correlation = " << correlation << dendl;
-    #endif
+//     #ifdef COREFS_SRC
+//     char *correlation = (char *)malloc(sizeof(char)*(pmatch[0].rm_eo - pmatch[0].rm_so - start));
+//     strncpy(correlation, &data[pmatch[0].rm_so + start], pmatch[0].rm_eo - pmatch[0].rm_so - start + 1);
+//     correlation[pmatch[0].rm_eo - pmatch[0].rm_so - start] = '\0';
+//     ldout(cct, 2) << "corefs.correlation = " << correlation << dendl;
+//     #endif
 
-    dc_value *ds = (dc_value*)malloc(sizeof(dc_value));
-    ds->score = SCORE_INIT;
-    ds->offset = pmatch[0].rm_so + start + pass + offset;
-    ds->len = pmatch[0].rm_eo - pmatch[0].rm_so - start - 1;
+//     dc_value *ds = (dc_value*)malloc(sizeof(dc_value));
+//     ds->score = SCORE_INIT;
+//     ds->offset = pmatch[0].rm_so + start + pass + offset;
+//     ds->len = pmatch[0].rm_eo - pmatch[0].rm_so - start - 1;
 
-    // corre_offset = pmatch[0].rm_so + start + pass;
-    // corre_len = pmatch[0].rm_eo - pmatch[0].rm_so - start - 1;
-    // ldout(cct, 2) << "offset=" << corre_offset << ", len=" << corre_len << dendl;
-    // strncpy(value, (char*)&score, sizeof(int));
-    // strncpy(value+sizeof(int), (char*)&corre_offset, sizeof(long));
-    // strncpy(value+sizeof(int)+sizeof(long), (char*)&corre_len, sizeof(long));
+//     // corre_offset = pmatch[0].rm_so + start + pass;
+//     // corre_len = pmatch[0].rm_eo - pmatch[0].rm_so - start - 1;
+//     // ldout(cct, 2) << "offset=" << corre_offset << ", len=" << corre_len << dendl;
+//     // strncpy(value, (char*)&score, sizeof(int));
+//     // strncpy(value+sizeof(int), (char*)&corre_offset, sizeof(long));
+//     // strncpy(value+sizeof(int)+sizeof(long), (char*)&corre_len, sizeof(long));
 
-    #ifdef COREFS_SRC
-    s_corre = correlation;
-    #endif
+//     #ifdef COREFS_SRC
+//     s_corre = correlation;
+//     #endif
 
-    // is there overwritten?
-    #ifdef COREFS_OVERWRITE
-    map<string, bufferptr>::iterator iter;
-    void *tmp;
-    for(iter = in->xattrs.begin(); iter != in->xattrs.end(); ){
-      tmp = (void*)malloc(sizeof(dc_value));
-      memcpy(tmp, iter->second.c_str(), sizeof(dc_value));
-      dc_value *tmp_dc = reinterpret_cast<dc_value *>(tmp);
-      float tmp_offset = tmp_dc->offset;
-      float tmp_len = tmp_dc->len;
-      ldout(cct, 2) << __func__ << " get xattrs <" << iter->first << ", " << tmp_dc->score << ", " << tmp_offset << ", " << tmp_len << "> into inode." << *in << dendl;
-      if (tmp_offset + tmp_len <= in->size){
-        if(correlation_overlap(tmp_offset, tmp_len, ds->offset, ds->len)){
-          // overlapped with existing correlations iter and remove iter
-          ldout(cct, 2) << __func__ << " overlapped with " << iter->first << " and remove " << iter->first << dendl;
-          in->xattrs.erase(iter++);
-        }
-        else
-          iter++;
-      }
-      else{
-        ldout(cct, 2) << __func__ << iter->first << " is beyond of existing file size and should remove it."  << dendl;
-        in->xattrs.erase(iter++);
-      }
-    }
+//     // is there overwritten?
+//     #ifdef COREFS_OVERWRITE
+//     map<string, bufferptr>::iterator iter;
+//     void *tmp;
+//     for(iter = in->xattrs.begin(); iter != in->xattrs.end(); ){
+//       tmp = (void*)malloc(sizeof(dc_value));
+//       memcpy(tmp, iter->second.c_str(), sizeof(dc_value));
+//       dc_value *tmp_dc = reinterpret_cast<dc_value *>(tmp);
+//       float tmp_offset = tmp_dc->offset;
+//       float tmp_len = tmp_dc->len;
+//       ldout(cct, 2) << __func__ << " get xattrs <" << iter->first << ", " << tmp_dc->score << ", " << tmp_offset << ", " << tmp_len << "> into inode." << *in << dendl;
+//       if (tmp_offset + tmp_len <= in->size){
+//         if(correlation_overlap(tmp_offset, tmp_len, ds->offset, ds->len)){
+//           // overlapped with existing correlations iter and remove iter
+//           ldout(cct, 2) << __func__ << " overlapped with " << iter->first << " and remove " << iter->first << dendl;
+//           in->xattrs.erase(iter++);
+//         }
+//         else
+//           iter++;
+//       }
+//       else{
+//         ldout(cct, 2) << __func__ << iter->first << " is beyond of existing file size and should remove it."  << dendl;
+//         in->xattrs.erase(iter++);
+//       }
+//     }
 
-    free(tmp);
-    #endif
+//     free(tmp);
+//     #endif
 
-    // insert new correlations
-    corefs_set_xattrs(in, s_corre, s_corre.size(), reinterpret_cast<void *>(ds));
-    // corefs_set_xattrs(in, s_corre.c_str(), s_corre.size(), value);
+//     // insert new correlations
+//     corefs_set_xattrs(in, s_corre, s_corre.size(), reinterpret_cast<void *>(ds));
+//     // corefs_set_xattrs(in, s_corre.c_str(), s_corre.size(), value);
 
-    free(correlation);
-    free(ds);
-    pass = pmatch[0].rm_eo;
-    data += pass;
-    if(!*data)
-      break;
-  }
-  if(flag_match)
-    mark_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
-  else
-    ldout(cct, 2) << "pattern not matched" << dendl;
-  ldout(cct, 2) << " semantic analysis done." << dendl;
-  regfree(&reg);
-}
+//     free(correlation);
+//     free(ds);
+//     pass = pmatch[0].rm_eo;
+//     data += pass;
+//     if(!*data)
+//       break;
+//   }
+//   if(flag_match)
+//     mark_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
+//   else
+//     ldout(cct, 2) << "pattern not matched" << dendl;
+//   ldout(cct, 2) << " semantic analysis done." << dendl;
+//   regfree(&reg);
+// }
 
 #endif

@@ -3109,7 +3109,7 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
         dout(2) << "[JJ]" << j << dendl;
        if(j >= max)
          break;
-      filename_corre = pxat->first;
+      filename_corre = pxat->first.substr(8);  // delete user.dc. prefix
       if(filename_corre[0] != '/'){
         dout(2) << __func__ << "filename_corre is not with / prefix" << dendl;
         continue;

@@ -8994,133 +8994,12 @@ success:
     ldout(cct, 7) << "wrote to " << totalwritten+offset << ", leaving file size at " << in->size << dendl;
   }
 
- // corefs
-  #ifdef COREFS_SEMANTIC
-    // ldout(cct, 2) << "[corefs_prefetch]" << dendl;
-    // filepath path_in_long;
-    // in->make_long_path(path_in_long);
-    // ldout(cct, 2) << "long path = " << path_in_long << dendl;
+ // // corefs
+ //  #ifdef COREFS_SEMANTIC
 
-    // C++ version for regex
-    // due to slowly process, pass it
-  //   std::string pattern("#include\\s\"((\\w+|/)+)\\.(\\w+)\"");
-  //   pattern = "[[:alpha:]]*" + pattern + "[[:alpha:]]*";
-  //   std::regex r(pattern);
-  //   string data = buf;
-  //   string path_corre, corre;
-  //   int first, last;
-  //   int num_slash;
-  //   int dep_path;
-  //   int flag_match = 0;
-
-  //   for(std::sregex_iterator it(data.begin(), data.end(), r), end; it != end; ++it){
-  //     flag_match = 1;
-  //     path_corre = it->str(); 
-  //     first = path_corre.find("\"");
-  //     last = path_corre.find("\"", first + 1);
-  //     corre = path_corre.substr(first + 1, last- first - 1);
-  //     ldout(cct, 2) << "correlation = " << corre << dendl;
-  //     num_slash = 0;
-  //     for(size_t coursor = 0; (coursor=corre.find('/', coursor)) != std::string::npos; num_slash++, coursor++);
-  //     ldout(cct, 2) << "number of slash =  " << num_slash << dendl;
-  //     dep_path = path_in_long.depth();
-  //     ldout(cct, 2) << "depth = " << dep_path << dendl;
-  //     filepath new_corre = path_in_long.prefixpath(dep_path- num_slash - 1);
-  //     ldout(cct, 2) << "number of prefix in path = " << new_corre << dendl;
-  //     new_corre.push_dentry(corre);
-
-  //     ldout(cct, 2) << "new correlation = " << new_corre << dendl;
-  //     ldout(cct, 2) << "new correlation = " << "/"+new_corre.get_path() << dendl;
-
-  //     string s_corre = "/" + new_corre.get_path();
-  //     ldout(cct, 2) << "final correlation = " << s_corre << dendl;
-  //     //corefs_set_xattrs(in, s_corre.c_str(), s_corre.size());
-  //   }
-  //   if(flag_match)
-  //     mark_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
-  //   else
-  //     ldout(cct, 2) << "pattern not matched" << dendl;
-  // }
-
-  // key function to extract correlations, now support source code
-  corefs_extract_correlations(in, buf, offset);
+ //  corefs_extract_correlations(in, buf, offset);
   
-
-  //   const char* pattern;
-  //   #ifdef COREFS_SEMANTIC_CODE
-  //   pattern = "^#include\\s\"((\\w+(/|_|-)?)+)\\.h\"$";
-  //   #endif
-
-  //   int coursor_char;
-  //   int num_slash;
-  //   int dep_path;
-  //   regex_t reg;
-  //   regcomp(&reg, pattern, REG_EXTENDED | REG_NEWLINE);
-  //   const size_t nmatch = 1;
-  //   regmatch_t pmatch[1];
-  //   int flag_match = 0;
-  //   char * data = (char *)buf;
-
-  //   while(!regexec(&reg, data, nmatch, pmatch, 0)){
-  //     //Matched!
-  //     flag_match = 1;
-  //     ldout(cct, 2) << " pattern matched" << dendl;
-  //     // decrease 11 to exclude other un-correlated chars
-  //     char *correlation = (char *)malloc(sizeof(char)*(pmatch[0].rm_eo - pmatch[0].rm_so - 10));
-  //     strncpy(correlation, &data[pmatch[0].rm_so + 10], pmatch[0].rm_eo - pmatch[0].rm_so - 10);
-  //     correlation[pmatch[0].rm_eo - pmatch[0].rm_so - 11] = '\0';
-  //     ldout(cct, 2) << "corefs.correlation = " << correlation << dendl;
-  //     coursor_char = 0;
-  //     num_slash = 0;
-  //     while(correlation[coursor_char]!='\0'){
-  //       if(correlation[coursor_char] == '/')
-  //         num_slash++;
-  //       coursor_char++;
-  //     }
-  //     ldout(cct, 2) << "number of slash =  " << num_slash << dendl;
-  //     dep_path = path_in_long.depth();
-  //     ldout(cct, 2) << "depth = " << dep_path << dendl;
-  //     filepath new_corre = path_in_long.prefixpath(dep_path- num_slash - 1);
-  //     ldout(cct, 2) << "number of prefix in path = " << new_corre << dendl;
-  //     new_corre.push_dentry(correlation);
-
-  //     ldout(cct, 2) << "new correlation = " << new_corre << dendl;
-  //     ldout(cct, 2) << "new correlation_2 = " << "/"+new_corre.get_path() << dendl;
-
-  //     string s_corre = "/" + new_corre.get_path();
-  //     ldout(cct, 2) << "final correlation = " << s_corre << dendl;
-  //     //corefs_set_xattrs(in, s_corre.c_str(), s_corre.size());
-
-  //     free(correlation);
-
-  //     data += pmatch[0].rm_eo;
-  //     if(!*data)
-  //       break;
-  //   }
-  //   if(flag_match)
-  //     mark_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
-  //   else
-  //     ldout(cct, 2) << "pattern not matched" << dendl;
-  //   regfree(&reg);
-  // }
-
-    // char tmp[1024];
-    // int len,r_sscanf;
-    // len = 0;
-    // r_sscanf = sscanf(buf, "src=%s", tmp);
-    // if(r_sscanf){
-    //   ldout(cct, 1) << tmp << dendl;
-    //   len = strlen(tmp);
-    //   corefs_set_xattrs(in,tmp,len,0);
-    // }
-    // mark_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
-    // while(sscanf(buf+len+5, "src=%s", tmp) > 0){
-    //   ldout(cct, 1) << tmp << dendl;
-    //   size = strlen(tmp);
-    //   corefs_set_xattrs(in,tmp,size,0);
-    //   len += size;
-    // }
-  #endif
+ //  #endif
 
   in->mtime = ceph_clock_now(cct);
   mark_caps_dirty(in, CEPH_CAP_FILE_WR );
@@ -10583,8 +10462,8 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
   int res;
   if (strncmp(name, "user.dc.", 8) == 0){
      // cache xattrs in client buffer
-    corefs_set_xattrs(in, name + 8, size, value);
-    make_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
+    corefs_set_xattrs(in, name + 8, size, (void*)value);
+    mark_caps_dirty(in, CEPH_CAP_XATTR_EXCL);
   }
   else
     res = _do_setxattr(in, name, value, size, flags, uid, gid);
