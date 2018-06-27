@@ -16,7 +16,9 @@
 #ifndef CEPH_SIMPLELOCK_H
 #define CEPH_SIMPLELOCK_H
 
-#include "mdstypes.h"
+#include <boost/intrusive_ptr.hpp>
+
+#include "MDSCacheObject.h"
 #include "MDSContext.h"
 
 // -- lock types --
@@ -37,13 +39,14 @@ inline const char *get_lock_type_name(int t) {
   case CEPH_LOCK_INO: return "ino";
   case CEPH_LOCK_IFLOCK: return "iflock";
   case CEPH_LOCK_IPOLICY: return "ipolicy";
-  default: assert(0); return 0;
+  default: ceph_abort(); return 0;
   }
 }
 
 #include "include/memory.h"
+
 struct MutationImpl;
-typedef ceph::shared_ptr<MutationImpl> MutationRef;
+typedef boost::intrusive_ptr<MutationImpl> MutationRef;
 
 extern "C" {
 #include "locks.h"
@@ -117,6 +120,8 @@ public:
     case LOCK_XSYN_EXCL: return "xsyn->excl";
     case LOCK_EXCL_XSYN: return "excl->xsyn";
     case LOCK_XSYN_SYNC: return "xsyn->sync";
+    case LOCK_XSYN_LOCK: return "xsyn->lock";
+    case LOCK_XSYN_MIX: return "xsyn->mix";
 
     case LOCK_SYNC_MIX: return "sync->mix";
     case LOCK_SYNC_MIX2: return "sync->mix(2)";
@@ -141,7 +146,7 @@ public:
 
     case LOCK_SNAP_SYNC: return "snap->sync";
 
-    default: assert(0); return 0;
+    default: ceph_abort(); return 0;
     }
   }
 
@@ -162,19 +167,25 @@ protected:
 
   // lock state
   __s16 state;
+  __s16 state_flags;
+
+  enum {
+    LEASED		= 1 << 0,
+    NEED_RECOVER	= 1 << 1,
+  };
 
 private:
-  __s16 num_rdlock;
-  __s32 num_client_lease;
+  int num_rdlock;
 
+  // XXX not in mempool
   struct unstable_bits_t {
     set<__s32> gather_set;  // auth+rep.  >= 0 is mds, < 0 is client
 
     // local state
-    int num_wrlock, num_xlock;
+    int num_wrlock = 0, num_xlock = 0;
     MutationRef xlock_by;
-    client_t xlock_by_client;
-    client_t excl_client;
+    client_t xlock_by_client = -1;
+    client_t excl_client = -1;
 
     bool empty() {
       return
@@ -186,25 +197,20 @@ private:
 	excl_client == -1;
     }
 
-    unstable_bits_t() : num_wrlock(0),
-			num_xlock(0),
-			xlock_by(),
-			xlock_by_client(-1),
-			excl_client(-1) {}
+    unstable_bits_t() {}
   };
 
-  mutable unstable_bits_t *_unstable;
+  mutable std::unique_ptr<unstable_bits_t> _unstable;
 
   bool have_more() const { return _unstable ? true : false; }
   unstable_bits_t *more() const {
     if (!_unstable)
-      _unstable = new unstable_bits_t;
-    return _unstable;
+      _unstable.reset(new unstable_bits_t);
+    return _unstable.get();
   }
   void try_clear_more() {
     if (_unstable && _unstable->empty()) {
-      delete _unstable;
-      _unstable = NULL;
+      _unstable.reset();
     }
   }
 
@@ -223,13 +229,10 @@ public:
     type(lt),
     parent(o), 
     state(LOCK_SYNC),
-    num_rdlock(0),
-    num_client_lease(0),
-    _unstable(NULL)
+    state_flags(0),
+    num_rdlock(0)
   {}
-  virtual ~SimpleLock() {
-    delete _unstable;
-  }
+  virtual ~SimpleLock() {}
 
   virtual bool is_scatterlock() const {
     return false;
@@ -258,7 +261,7 @@ public:
     case CEPH_LOCK_IFLOCK:   return 8 +10*SimpleLock::WAIT_BITS;
     case CEPH_LOCK_IPOLICY:  return 8 +11*SimpleLock::WAIT_BITS;
     default:
-      assert(0);
+      ceph_abort();
     }
   }
 
@@ -322,19 +325,28 @@ public:
     //assert(!is_stable() || gather_set.size() == 0);  // gather should be empty in stable states.
     return s;
   }
-  void set_state_rejoin(int s, list<MDSInternalContextBase*>& waiters) {
-    if (!is_stable() && get_parent()->is_auth()) {
-      state = s;
-      get_parent()->auth_unpin(this);
-    } else {
-      state = s;
-    }
+  void set_state_rejoin(int s, list<MDSInternalContextBase*>& waiters, bool survivor) {
+    assert(!get_parent()->is_auth());
+
+    // If lock in the replica object was not in SYNC state when auth mds of the object failed.
+    // Auth mds of the object may take xlock on the lock and change the object when replaying
+    // unsafe requests.
+    if (!survivor || state != LOCK_SYNC)
+      mark_need_recover();
+
+    state = s;
+
     if (is_stable())
       take_waiting(SimpleLock::WAIT_ALL, waiters);
   }
 
   bool is_stable() const {
     return get_sm()->states[state].next == 0;
+  }
+  bool is_unstable_and_locked() const {
+    if (is_stable())
+      return false;
+    return is_rdlocked() || is_wrlocked() || is_xlocked();
   }
   int get_next_state() {
     return get_sm()->states[state].next;
@@ -369,10 +381,9 @@ public:
   }
 
   void init_gather() {
-    for (compact_map<mds_rank_t,unsigned>::iterator p = parent->replicas_begin();
-	 p != parent->replicas_end();
-	 ++p)
-      more()->gather_set.insert(p->first);
+    for (const auto p : parent->get_replicas()) {
+      more()->gather_set.insert(p.first);
+    }
   }
   bool is_gathering() const {
     return have_more() && !more()->gather_set.empty();
@@ -522,25 +533,30 @@ public:
   }
   
   // lease
+  bool is_leased() const {
+    return state_flags & LEASED;
+  }
   void get_client_lease() {
-    num_client_lease++;
+    assert(!is_leased());
+    state_flags |= LEASED;
   }
   void put_client_lease() {
-    assert(num_client_lease > 0);
-    num_client_lease--;
-    if (num_client_lease == 0) {
-      try_clear_more();
-    }
-  }
-  bool is_leased() const {
-    return num_client_lease > 0;
-  }
-  int get_num_client_lease() const {
-    return num_client_lease;
+    assert(is_leased());
+    state_flags &= ~LEASED;
   }
 
   bool is_used() const {
-    return is_xlocked() || is_rdlocked() || is_wrlocked() || num_client_lease;
+    return is_xlocked() || is_rdlocked() || is_wrlocked() || is_leased();
+  }
+
+  bool needs_recover() const {
+    return state_flags & NEED_RECOVER;
+  }
+  void mark_need_recover() {
+    state_flags |= NEED_RECOVER;
+  }
+  void clear_need_recover() {
+    state_flags &= ~NEED_RECOVER;
   }
 
   // encode/decode
@@ -572,10 +588,10 @@ public:
     if (is_new)
       state = s;
   }
-  void decode_state_rejoin(bufferlist::iterator& p, list<MDSInternalContextBase*>& waiters) {
+  void decode_state_rejoin(bufferlist::iterator& p, list<MDSInternalContextBase*>& waiters, bool survivor) {
     __s16 s;
     ::decode(s, p);
-    set_state_rejoin(s, waiters);
+    set_state_rejoin(s, waiters, survivor);
   }
 
 
@@ -654,8 +670,8 @@ public:
     out << get_state_name(get_state());
     if (!get_gather_set().empty())
       out << " g=" << get_gather_set();
-    if (num_client_lease)
-      out << " l=" << num_client_lease;
+    if (is_leased())
+      out << " l";
     if (is_rdlocked()) 
       out << " r=" << get_num_rdlocks();
     if (is_wrlocked()) 

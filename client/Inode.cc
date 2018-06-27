@@ -5,33 +5,38 @@
 #include "Inode.h"
 #include "Dentry.h"
 #include "Dir.h"
+#include "Fh.h"
 #include "MetaSession.h"
 #include "ClientSnapRealm.h"
-#include "UserGroups.h"
-Inode::Inode(Client *c, vinodeno_t vino, file_layout_t *newlayout)
-    : prefetched(false),accessed(false),times_phd(0),period_times_phd(0),//corefs
-      client(c), ino(vino.ino), snapid(vino.snapid), faked_ino(0),
-      rdev(0), mode(0), uid(0), gid(0), nlink(0),
-      size(0), truncate_seq(1), truncate_size(-1),
-      time_warp_seq(0), max_size(0), version(0), xattr_version(0),
-      inline_version(0), flags(0),
-      dir(0), dir_release_count(1), dir_ordered_count(1),
-      dir_hashed(false), dir_replicated(false), auth_cap(NULL),
-      cap_dirtier_uid(-1), cap_dirtier_gid(-1),
-      dirty_caps(0), flushing_caps(0), shared_gen(0), cache_gen(0),
-      snap_caps(0), snap_cap_refs(0),
-      cap_item(this), flushing_cap_item(this),
-      snaprealm(0), snaprealm_item(this),
-      oset((void *)this, newlayout->pool_id, ino),
-      reported_size(0), wanted_max_size(0), requested_max_size(0),
-      _ref(0), ll_ref(0), dn_set(),
-      fcntl_locks(NULL), flock_locks(NULL),
-      async_err(0)
-  {
-    lsubdout(client->cct, client, 1) << "corefs-create-inode"  << dendl;
-    memset(&dir_layout, 0, sizeof(dir_layout));
-    memset(&quota, 0, sizeof(quota));
+#include "Delegation.h"
+
+#include "mds/flock.h"
+
+Inode::~Inode()
+{
+  cap_item.remove_myself();
+  snaprealm_item.remove_myself();
+
+  if (snapdir_parent) {
+    snapdir_parent->flags &= ~I_SNAPDIR_OPEN;
+    snapdir_parent.reset();
   }
+
+  if (!oset.objects.empty()) {
+    lsubdout(client->cct, client, 0) << __func__ << ": leftover objects on inode 0x"
+      << std::hex << ino << std::dec << dendl;
+    assert(oset.objects.empty());
+  }
+
+  if (!delegations.empty()) {
+    lsubdout(client->cct, client, 0) << __func__ << ": leftover delegations on inode 0x"
+      << std::hex << ino << std::dec << dendl;
+    assert(delegations.empty());
+  }
+
+  delete fcntl_locks;
+  delete flock_locks;
+}
 
 ostream& operator<<(ostream &out, const Inode &in)
 {
@@ -118,6 +123,7 @@ void Inode::make_nosnap_relative_path(filepath& p)
 void Inode::get_open_ref(int mode)
 {
   open_by_mode[mode]++;
+  break_deleg(!(mode & CEPH_FILE_MODE_WR));
 }
 
 bool Inode::put_open_ref(int mode)
@@ -144,9 +150,6 @@ void Inode::get_cap_ref(int cap)
 
 int Inode::put_cap_ref(int cap)
 {
-  // if cap is always a single bit (which it seems to be)
-  // all this logic is equivalent to:
-  // if (--cap_refs[c]) return false; else return true;
   int last = 0;
   int n = 0;
   while (cap) {
@@ -178,7 +181,7 @@ bool Inode::cap_is_valid(Cap* cap) const
     << "cap expire  " << cap->session->cap_ttl << std::endl
     << "cur time    " << ceph_clock_now(cct) << std::endl;*/
   if ((cap->session->cap_gen <= cap->gen)
-      && (ceph_clock_now(client->cct) < cap->session->cap_ttl)) {
+      && (ceph_clock_now() < cap->session->cap_ttl)) {
     return true;
   }
   return false;
@@ -195,6 +198,13 @@ int Inode::caps_issued(int *implemented) const
       c |= it->second->issued;
       i |= it->second->implemented;
     }
+
+  // exclude caps issued by non-auth MDS, but are been revoking by
+  // the auth MDS. The non-auth MDS should be revoking/exporting
+  // these caps, but the message is delayed.
+  if (auth_cap)
+    c &= ~auth_cap->implemented | auth_cap->issued;
+
   if (implemented)
     *implemented = i;
   return c;
@@ -212,19 +222,33 @@ void Inode::try_touch_cap(mds_rank_t mds)
     touch_cap(caps[mds]);
 }
 
-bool Inode::caps_issued_mask(unsigned mask)
+/**
+ * caps_issued_mask - check whether we have all of the caps in the mask
+ * @mask: mask to check against
+ * @allow_impl: whether the caller can also use caps that are implemented but not issued
+ *
+ * This is the bog standard "check whether we have the required caps" operation.
+ * Typically, we only check against the capset that is currently "issued".
+ * In other words, we ignore caps that have been revoked but not yet released.
+ *
+ * Some callers (particularly those doing attribute retrieval) can also make
+ * use of the full set of "implemented" caps to satisfy requests from the
+ * cache.
+ *
+ * Those callers should refrain from taking new references to implemented
+ * caps!
+ */
+bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 {
   int c = snap_caps;
-  lsubdout(client->cct, client, 15) << " caps_issued_mask " << mask << dendl;
-  if ((c & mask) == mask){
-    lsubdout(client->cct, client, 15) << " mask is same as snap_caps " << dendl;
+  int i = 0;
+
+  if ((c & mask) == mask)
     return true;
-  }
   // prefer auth cap
   if (auth_cap &&
       cap_is_valid(auth_cap) &&
       (auth_cap->issued & mask) == mask) {
-    lsubdout(client->cct, client, 15) << " prefer auth cap " << dendl;
     touch_cap(auth_cap);
     return true;
   }
@@ -234,23 +258,25 @@ bool Inode::caps_issued_mask(unsigned mask)
        ++it) {
     if (cap_is_valid(it->second)) {
       if ((it->second->issued & mask) == mask) {
-        lsubdout(client->cct, client, 15) << " try any cap " << dendl;
 	touch_cap(it->second);
 	return true;
       }
       c |= it->second->issued;
+      i |= it->second->implemented;
     }
   }
+
+  if (allow_impl)
+    c |= i;
+
   if ((c & mask) == mask) {
     // bah.. touch them all
     for (map<mds_rank_t,Cap*>::iterator it = caps.begin();
 	 it != caps.end();
 	 ++it)
       touch_cap(it->second);
-    lsubdout(client->cct, client, 15) << " bah.. touch them all " << dendl;
     return true;
   }
-  lsubdout(client->cct, client, 15) << " no local cap " << dendl;
   return false;
 }
 
@@ -284,9 +310,38 @@ int Inode::caps_wanted()
   return want;
 }
 
+int Inode::caps_mds_wanted()
+{
+  int want = 0;
+  for (auto it = caps.begin(); it != caps.end(); ++it)
+    want |= it->second->wanted;
+  return want;
+}
+
 int Inode::caps_dirty()
 {
   return dirty_caps | flushing_caps;
+}
+
+const UserPerm* Inode::get_best_perms()
+{
+  const UserPerm *perms = NULL;
+  for (const auto ci : caps) {
+    const UserPerm& iperm = ci.second->latest_perms;
+    if (!perms) { // we don't have any, take what's present
+      perms = &iperm;
+    } else if (iperm.uid() == uid) {
+      if (iperm.gid() == gid) { // we have the best possible, return
+	return &iperm;
+      }
+      if (perms->uid() != uid) { // take uid > gid every time
+	perms = &iperm;
+      }
+    } else if (perms->uid() != uid && iperm.gid() == gid) {
+      perms = &iperm; // a matching gid is better than nothing
+    }
+  }
+  return perms;
 }
 
 bool Inode::have_valid_size()
@@ -311,12 +366,12 @@ Dir *Inode::open_dir()
   return dir;
 }
 
-bool Inode::check_mode(uid_t ruid, UserGroups& groups, unsigned want)
+bool Inode::check_mode(const UserPerm& perms, unsigned want)
 {
-  if (uid == ruid) {
+  if (uid == perms.uid()) {
     // if uid is owner, owner entry determines access
     want = want << 6;
-  } else if (groups.is_in(gid)) {
+  } else if (perms.gid_in_groups(gid)) {
     // if a gid or sgid matches the owning group, group entry determines access
     want = want << 3;
   }
@@ -339,20 +394,6 @@ int Inode::_put(int n) {
   return _ref;
 }
 
-// corefs
-Inode::~Inode(){
-  lsubdout(client->cct, client, 1) << "corefs-delete-inode"  << dendl;
-  if(this->prefetched == true){
-    // lsubdout(client->cct, client, 1) << " [corefs-pre-1-prefetching]"  << dendl;
-    if(this->accessed == false)
-      lsubdout(client->cct, client, 1) << " [corefs.false-prefetching]"  << dendl;
-    if(this->accessed == true)
-      lsubdout(client->cct, client, 1) << " [corefs.true-prefetching]" << dendl;
-  }
-  if(this->prefetched == false)
-    lsubdout(client->cct, client, 2) << " [corefs-no-prefetching]" << dendl;
-}
-
 
 void Inode::dump(Formatter *f) const
 {
@@ -361,24 +402,29 @@ void Inode::dump(Formatter *f) const
   if (rdev)
     f->dump_unsigned("rdev", rdev);
   f->dump_stream("ctime") << ctime;
+  f->dump_stream("btime") << btime;
   f->dump_stream("mode") << '0' << std::oct << mode << std::dec;
   f->dump_unsigned("uid", uid);
   f->dump_unsigned("gid", gid);
-  f->dump_unsigned("nlink", nlink);
+  f->dump_int("nlink", nlink);
 
-  f->dump_int("size", size);
-  f->dump_int("max_size", max_size);
-  f->dump_int("truncate_seq", truncate_seq);
-  f->dump_int("truncate_size", truncate_size);
+  f->dump_unsigned("size", size);
+  f->dump_unsigned("max_size", max_size);
+  f->dump_unsigned("truncate_seq", truncate_seq);
+  f->dump_unsigned("truncate_size", truncate_size);
   f->dump_stream("mtime") << mtime;
   f->dump_stream("atime") << atime;
-  f->dump_int("time_warp_seq", time_warp_seq);
+  f->dump_unsigned("time_warp_seq", time_warp_seq);
+  f->dump_unsigned("change_attr", change_attr);
 
   f->dump_object("layout", layout);
   if (is_dir()) {
     f->open_object_section("dir_layout");
     ::dump(dir_layout, f);
     f->close_section();
+
+    f->dump_bool("complete", flags & I_COMPLETE);
+    f->dump_bool("ordered", flags & I_DIR_ORDERED);
 
     /* FIXME when wip-mds-encoding is merged ***
     f->open_object_section("dir_stat");
@@ -446,10 +492,10 @@ void Inode::dump(Formatter *f) const
     f->close_section();
   }
   if (!cap_snaps.empty()) {
-    for (map<snapid_t,CapSnap*>::const_iterator p = cap_snaps.begin(); p != cap_snaps.end(); ++p) {
+    for (const auto &p : cap_snaps) {
       f->open_object_section("cap_snap");
-      f->dump_stream("follows") << p->first;
-      p->second->dump(f);
+      f->dump_stream("follows") << p.first;
+      p.second.dump(f);
       f->close_section();
     }
   }
@@ -459,8 +505,8 @@ void Inode::dump(Formatter *f) const
     f->open_array_section("open_by_mode");
     for (map<int,int>::const_iterator p = open_by_mode.begin(); p != open_by_mode.end(); ++p) {
       f->open_object_section("ref");
-      f->dump_unsigned("mode", p->first);
-      f->dump_unsigned("refs", p->second);
+      f->dump_int("mode", p->first);
+      f->dump_int("refs", p->second);
       f->close_section();
     }
     f->close_section();
@@ -535,4 +581,169 @@ void CapSnap::dump(Formatter *f) const
   f->dump_int("writing", (int)writing);
   f->dump_int("dirty_data", (int)dirty_data);
   f->dump_unsigned("flush_tid", flush_tid);
+}
+
+void Inode::set_async_err(int r)
+{
+  for (const auto &fh : fhs) {
+    fh->async_err = r;
+  }
+}
+
+bool Inode::has_recalled_deleg()
+{
+  if (delegations.empty())
+    return false;
+
+  // Either all delegations are recalled or none are. Just check the first.
+  Delegation& deleg = delegations.front();
+  return deleg.is_recalled();
+}
+
+void Inode::recall_deleg(bool skip_read)
+{
+  if (delegations.empty())
+    return;
+
+  // Issue any recalls
+  for (list<Delegation>::iterator d = delegations.begin();
+       d != delegations.end(); ++d) {
+
+    Delegation& deleg = *d;
+    deleg.recall(skip_read);
+  }
+}
+
+bool Inode::delegations_broken(bool skip_read)
+{
+  if (delegations.empty()) {
+    lsubdout(client->cct, client, 10) <<
+	  __func__ << ": delegations empty on " << *this << dendl;
+    return true;
+  }
+
+  if (skip_read) {
+    Delegation& deleg = delegations.front();
+    lsubdout(client->cct, client, 10) <<
+	__func__ << ": read delegs only on " << *this << dendl;
+    if (deleg.get_type() == CEPH_FILE_MODE_RD) {
+	return true;
+    }
+  }
+  lsubdout(client->cct, client, 10) <<
+	__func__ << ": not broken" << *this << dendl;
+  return false;
+}
+
+void Inode::break_deleg(bool skip_read)
+{
+  lsubdout(client->cct, client, 10) <<
+	  __func__ << ": breaking delegs on " << *this << dendl;
+
+  recall_deleg(skip_read);
+
+  while (!delegations_broken(skip_read))
+    client->wait_on_list(waitfor_deleg);
+}
+
+/**
+ * set_deleg: request a delegation on an open Fh
+ * @fh: filehandle on which to acquire it
+ * @type: delegation request type
+ * @cb: delegation recall callback function
+ * @priv: private pointer to be passed to callback
+ *
+ * Attempt to acquire a delegation on an open file handle. If there are no
+ * conflicts and we have the right caps, allocate a new delegation, fill it
+ * out and return 0. Return an error if we can't get one for any reason.
+ */
+int Inode::set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv)
+{
+  lsubdout(client->cct, client, 10) <<
+	  __func__ << ": inode " << *this << dendl;
+
+  /*
+   * 0 deleg timeout means that they haven't been explicitly enabled. Don't
+   * allow it, with an unusual error to make it clear.
+   */
+  if (!client->get_deleg_timeout())
+    return -ETIME;
+
+  // Just say no if we have any recalled delegs still outstanding
+  if (has_recalled_deleg()) {
+    lsubdout(client->cct, client, 10) << __func__ <<
+	  ": has_recalled_deleg" << dendl;
+    return -EAGAIN;
+  }
+
+  // check vs. currently open files on this inode
+  switch (type) {
+  case CEPH_DELEGATION_RD:
+    if (open_count_for_write()) {
+      lsubdout(client->cct, client, 10) << __func__ <<
+	    ": open for write" << dendl;
+      return -EAGAIN;
+    }
+    break;
+  case CEPH_DELEGATION_WR:
+    if (open_count() > 1) {
+      lsubdout(client->cct, client, 10) << __func__ << ": open" << dendl;
+      return -EAGAIN;
+    }
+    break;
+  default:
+    return -EINVAL;
+  }
+
+  /*
+   * A delegation is essentially a long-held container for cap references that
+   * we delegate to the client until recalled. The caps required depend on the
+   * type of delegation (read vs. rw). This is entirely an opportunistic thing.
+   * If we don't have the necessary caps for the delegation, then we just don't
+   * grant one.
+   *
+   * In principle we could request the caps from the MDS, but a delegation is
+   * usually requested just after an open. If we don't have the necessary caps
+   * already, then it's likely that there is some sort of conflicting access.
+   *
+   * In the future, we may need to add a way to have this request caps more
+   * aggressively -- for instance, to handle WANT_DELEGATION for NFSv4.1+.
+   */
+  int need = ceph_deleg_caps_for_type(type);
+  if (!caps_issued_mask(need)) {
+    lsubdout(client->cct, client, 10) << __func__ << ": cap mismatch, have="
+      << ccap_string(caps_issued()) << " need=" << ccap_string(need) << dendl;
+    return -EAGAIN;
+  }
+
+  for (list<Delegation>::iterator d = delegations.begin();
+       d != delegations.end(); ++d) {
+    Delegation& deleg = *d;
+    if (deleg.get_fh() == fh) {
+      deleg.reinit(type, cb, priv);
+      return 0;
+    }
+  }
+
+  delegations.emplace_back(fh, type, cb, priv);
+  return 0;
+}
+
+/**
+ * unset_deleg - remove a delegation that was previously set
+ * @fh: file handle to clear delegation of
+ *
+ * Unlink delegation from the Inode (if there is one), put caps and free it.
+ */
+void Inode::unset_deleg(Fh *fh)
+{
+  for (list<Delegation>::iterator d = delegations.begin();
+       d != delegations.end(); ++d) {
+    Delegation& deleg = *d;
+    if (deleg.get_fh() == fh) {
+      delegations.erase(d);
+      client->signal_cond_list(waitfor_deleg);
+      break;
+    }
+  }
 }

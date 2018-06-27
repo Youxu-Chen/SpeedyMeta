@@ -1,2 +1,7 @@
-Sage Weil <sage@newdream.net>
-Ceph - scalable distributed storage system
+SpeedyMeta - scale metadata performance via correlation-based metadata prefetching
+
+----------------------------------------------------------------------------------
+
+This original project is built on Ceph Jewel 10.2.7. Now, we have updated speedymeta on Ceph Luminous 12.2.5.
+
+In this project, we only exhibit our modification on source code of Ceph Luminous 12.2.5.

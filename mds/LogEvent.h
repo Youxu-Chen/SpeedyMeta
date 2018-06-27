@@ -73,7 +73,7 @@ public:
   virtual ~LogEvent() { }
 
   string get_type_str() const;
-  static EventType str_to_type(std::string const &str);
+  static EventType str_to_type(boost::string_view str);
   EventType get_type() const { return _type; }
   void set_type(EventType t) { _type = t; }
 
@@ -109,13 +109,16 @@ public:
   /*** recovery ***/
   /* replay() - replay given event.  this is idempotent.
    */
-  virtual void replay(MDSRank *m) { assert(0); }
+  virtual void replay(MDSRank *m) { ceph_abort(); }
 
   /**
    * If the subclass embeds a MetaBlob, return it here so that
    * tools can examine metablobs while traversing lists of LogEvent.
    */
   virtual EMetaBlob *get_metablob() { return NULL; }
+
+private:
+  static const std::map<std::string, LogEvent::EventType> types;
 };
 
 inline ostream& operator<<(ostream& out, const LogEvent &le) {

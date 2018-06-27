@@ -6,14 +6,11 @@
 
 
 #include "include/types.h"
-#include "msg/msg_types.h"
 #include "include/xlist.h"
 #include "include/filepath.h"
-#include "include/atomic.h"
 #include "mds/mdstypes.h"
 #include "InodeRef.h"
-
-#include "common/Mutex.h"
+#include "UserPerm.h"
 
 #include "messages/MClientRequest.h"
 
@@ -50,7 +47,7 @@ public:
   __u32    sent_on_mseq;       // mseq at last submission of this request
   int      num_fwd;            // # of times i've been forwarded
   int      retry_attempt;
-  atomic_t ref;
+  std::atomic<uint64_t> ref = { 1 };
   
   MClientReply *reply;         // the reply
   bool kick;
@@ -72,6 +69,7 @@ public:
   list<Cond*> waitfor_safe;
 
   InodeRef target;
+  UserPerm perms;
 
   explicit MetaRequest(int op) :
     _dentry(NULL), _old_dentry(NULL), abort_rc(0),
@@ -84,12 +82,12 @@ public:
     regetattr_mask(0),
     mds(-1), resend_mds(-1), send_to_auth(false), sent_on_mseq(0),
     num_fwd(0), retry_attempt(0),
-    ref(1), reply(0), 
+    reply(0), 
     kick(false), success(false),
     got_unsafe(false), item(this), unsafe_item(this),
     unsafe_dir_item(this), unsafe_target_item(this),
     caller_cond(0), dispatch_cond(0) {
-    memset(&head, 0, sizeof(ceph_mds_request_head));
+    memset(&head, 0, sizeof(head));
     head.op = op;
   }
   ~MetaRequest();
@@ -154,13 +152,13 @@ public:
   Dentry *old_dentry();
 
   MetaRequest* get() {
-    ref.inc();
+    ref++;
     return this;
   }
 
   /// psuedo-private put method; use Client::put_request()
   bool _put() {
-    int v = ref.dec();
+    int v = --ref;
     return v == 0;
   }
 
@@ -171,9 +169,14 @@ public:
   void set_retry_attempt(int a) { head.num_retry = a; }
   void set_filepath(const filepath& fp) { path = fp; }
   void set_filepath2(const filepath& fp) { path2 = fp; }
-  void set_string2(const char *s) { path2.set_path(s, 0); }
-  void set_caller_uid(unsigned u) { head.caller_uid = u; }
-  void set_caller_gid(unsigned g) { head.caller_gid = g; }
+  void set_string2(const char *s) { path2.set_path(boost::string_view(s), 0); }
+  void set_caller_perms(const UserPerm& _perms) {
+    perms.shallow_copy(_perms);
+    head.caller_uid = perms.uid();
+    head.caller_gid = perms.gid();
+  }
+  uid_t get_uid() { return perms.uid(); }
+  uid_t get_gid() { return perms.gid(); }
   void set_data(const bufferlist &d) { data = d; }
   void set_dentry_wanted() {
     head.flags = head.flags | CEPH_MDS_FLAG_WANT_DENTRY;

@@ -15,7 +15,14 @@
 #ifndef CEPH_MDS_SERVER_H
 #define CEPH_MDS_SERVER_H
 
+#include <boost/utility/string_view.hpp>
+
 #include "MDSRank.h"
+#include "Mutation.h"
+
+#define _SPEEDYMETA
+// #define _SPEEDYMETA_DELETE
+#define _SPEEDYMETA_FEEDBACK
 
 class OSDMap;
 class PerfCounters;
@@ -28,53 +35,42 @@ class MClientRequest;
 class MClientReply;
 class MDLog;
 
-struct MutationImpl;
-struct MDRequestImpl;
-typedef ceph::shared_ptr<MutationImpl> MutationRef;
-typedef ceph::shared_ptr<MDRequestImpl> MDRequestRef;
-
 enum {
   l_mdss_first = 1000,
-  l_mdss_handle_client_request,
-  l_mdss_handle_slave_request,
-  l_mdss_handle_client_session,
   l_mdss_dispatch_client_request,
   l_mdss_dispatch_slave_request,
+  l_mdss_handle_client_request,
+  l_mdss_handle_client_session,
+  l_mdss_handle_slave_request,
+  l_mdss_req_create,
+  l_mdss_req_getattr,
+  l_mdss_req_getfilelock,
+  l_mdss_req_link,
+  l_mdss_req_lookup,
+  l_mdss_req_lookuphash,
+  l_mdss_req_lookupino,
+  l_mdss_req_lookupname,
+  l_mdss_req_lookupparent,
+  l_mdss_req_lookupsnap,
+  l_mdss_req_lssnap,
+  l_mdss_req_mkdir,
+  l_mdss_req_mknod,
+  l_mdss_req_mksnap,
+  l_mdss_req_open,
+  l_mdss_req_readdir,
+  l_mdss_req_rename,
+  l_mdss_req_renamesnap,
+  l_mdss_req_rmdir,
+  l_mdss_req_rmsnap,
+  l_mdss_req_rmxattr,
+  l_mdss_req_setattr,
+  l_mdss_req_setdirlayout,
+  l_mdss_req_setfilelock,
+  l_mdss_req_setlayout,
+  l_mdss_req_setxattr,
+  l_mdss_req_symlink,
+  l_mdss_req_unlink,
   l_mdss_last,
-};
-
-// corefs
-enum{
-  OP_LOOKUP,//
-  OP_GETATTR,//
-  OP_LOOKUPINO,//
-
-  OP_SETXATTR,//
-  OP_RMXATTR,//
-  OP_SETLAYOUT,//
-  OP_SETATTR,//
-  OP_SETFILELOCK,//
-  OP_GETFILELOCK,//
-  OP_SETDIRLAYOUT,//
-
-  OP_MKNOD,//
-  OP_LINK,//
-  OP_UNLINK,//
-  OP_RENAME,//
-  OP_MKDIR,//
-  OP_SYMLINK,//
-
-  OP_CREATE,//
-  OP_OPEN,//
-  OP_READDIR,//
-
-  OP_MKSNAP,//
-  OP_RMSNAP,//
-  OP_LSSNAP,//
-  OP_RENAMESNAP,
-
-  OP_NUM
-
 };
 
 class Server {
@@ -90,9 +86,12 @@ private:
   // State for while in reconnect
   MDSInternalContext *reconnect_done;
   int failed_reconnects;
+  bool reconnect_evicting;  // true if I am waiting for evictions to complete
+                            // before proceeding to reconnect_gather_finish
 
   friend class MDSContinuation;
   friend class ServerContext;
+  friend class ServerLogContext;
 
 public:
   bool terminating_sessions;
@@ -117,7 +116,6 @@ public:
   bool waiting_for_reconnect(client_t c) const;
   void dump_reconnect_status(Formatter *f) const;
 
-  Session *get_session(Message *m);
   void handle_client_session(class MClientSession *m);
   void _session_logged(Session *session, uint64_t state_seq, 
 		       bool open, version_t pv, interval_set<inodeno_t>& inos,version_t piv);
@@ -131,6 +129,7 @@ public:
   void terminate_sessions();
   void find_idle_sessions();
   void kill_session(Session *session, Context *on_safe);
+  size_t apply_blacklist(const std::set<entity_addr_t> &blacklist);
   void journal_close_session(Session *session, int state, Context *on_safe);
   void reconnect_clients(MDSInternalContext *reconnect_done_);
   void handle_client_reconnect(class MClientReconnect *m);
@@ -139,15 +138,15 @@ public:
   void reconnect_tick();
   void recover_filelocks(CInode *in, bufferlist locks, int64_t client);
 
-  void recall_client_state(float ratio);
+  void recall_client_state(void);
   void force_clients_readonly();
 
   // -- requests --
   void handle_client_request(MClientRequest *m);
 
   void journal_and_reply(MDRequestRef& mdr, CInode *tracei, CDentry *tracedn,
-			 LogEvent *le, MDSInternalContextBase *fin);
-  void submit_mdlog_entry(LogEvent *le, MDSInternalContextBase *fin,
+			 LogEvent *le, MDSLogContextBase *fin);
+  void submit_mdlog_entry(LogEvent *le, MDSLogContextBase *fin,
                           MDRequestRef& mdr, const char *evt);
   void dispatch_client_request(MDRequestRef& mdr);
   void early_reply(MDRequestRef& mdr, CInode *tracei, CDentry *tracedn);
@@ -171,14 +170,14 @@ public:
   bool check_fragment_space(MDRequestRef& mdr, CDir *in);
   bool check_access(MDRequestRef& mdr, CInode *in, unsigned mask);
   bool _check_access(Session *session, CInode *in, unsigned mask, int caller_uid, int caller_gid, int setattr_uid, int setattr_gid);
-  CDir *validate_dentry_dir(MDRequestRef& mdr, CInode *diri, const string& dname);
+  CDir *validate_dentry_dir(MDRequestRef& mdr, CInode *diri, boost::string_view dname);
   CDir *traverse_to_auth_dir(MDRequestRef& mdr, vector<CDentry*> &trace, filepath refpath);
-  CDentry *prepare_null_dentry(MDRequestRef& mdr, CDir *dir, const string& dname, bool okexist=false);
+  CDentry *prepare_null_dentry(MDRequestRef& mdr, CDir *dir, boost::string_view dname, bool okexist=false);
   CDentry *prepare_stray_dentry(MDRequestRef& mdr, CInode *in);
   CInode* prepare_new_inode(MDRequestRef& mdr, CDir *dir, inodeno_t useino, unsigned mode,
 			    file_layout_t *layout=NULL);
   void journal_allocated_inos(MDRequestRef& mdr, EMetaBlob *blob);
-  void apply_allocated_inos(MDRequestRef& mdr);
+  void apply_allocated_inos(MDRequestRef& mdr, Session *session);
 
   CInode* rdlock_path_pin_ref(MDRequestRef& mdr, int n, set<SimpleLock*>& rdlocks, bool want_auth,
 			      bool no_want_auth=false,
@@ -210,12 +209,17 @@ public:
   int parse_layout_vxattr(string name, string value, const OSDMap& osdmap,
 			  file_layout_t *layout, bool validate=true);
   int parse_quota_vxattr(string name, string value, quota_info_t *quota);
+  int check_layout_vxattr(MDRequestRef& mdr,
+                          string name,
+                          string value,
+                          file_layout_t *layout);
   void handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
 			 file_layout_t *dir_layout,
 			 set<SimpleLock*> rdlocks,
 			 set<SimpleLock*> wrlocks,
 			 set<SimpleLock*> xlocks);
   void handle_remove_vxattr(MDRequestRef& mdr, CInode *cur,
+			    file_layout_t *dir_layout,
 			    set<SimpleLock*> rdlocks,
 			    set<SimpleLock*> wrlocks,
 			    set<SimpleLock*> xlocks);
@@ -261,10 +265,10 @@ public:
   void _unlink_local_finish(MDRequestRef& mdr,
 			    CDentry *dn, CDentry *straydn,
 			    version_t);
-  bool _rmdir_prepare_witness(MDRequestRef& mdr, mds_rank_t who, CDentry *dn, CDentry *straydn);
+  bool _rmdir_prepare_witness(MDRequestRef& mdr, mds_rank_t who, vector<CDentry*>& trace, CDentry *straydn);
   void handle_slave_rmdir_prep(MDRequestRef& mdr);
   void _logged_slave_rmdir(MDRequestRef& mdr, CDentry *srcdn, CDentry *straydn);
-  void _commit_slave_rmdir(MDRequestRef& mdr, int r);
+  void _commit_slave_rmdir(MDRequestRef& mdr, int r, CDentry *straydn);
   void handle_slave_rmdir_prep_ack(MDRequestRef& mdr, MMDSSlaveRequest *ack);
   void do_rmdir_rollback(bufferlist &rbl, mds_rank_t master, MDRequestRef& mdr);
   void _rmdir_rollback_finish(MDRequestRef& mdr, metareqid_t reqid, CDentry *dn, CDentry *straydn);
@@ -285,7 +289,7 @@ public:
 
   // helpers
   bool _rename_prepare_witness(MDRequestRef& mdr, mds_rank_t who, set<mds_rank_t> &witnesse,
-			       CDentry *srcdn, CDentry *destdn, CDentry *straydn);
+			       vector<CDentry*>& srctrace, vector<CDentry*>& dsttrace, CDentry *straydn);
   version_t _rename_prepare_import(MDRequestRef& mdr, CDentry *srcdn, bufferlist *client_map_bl);
   bool _need_force_journal(CInode *diri, bool empty);
   void _rename_prepare(MDRequestRef& mdr,
@@ -307,24 +311,14 @@ public:
   void _rename_rollback_finish(MutationRef& mut, MDRequestRef& mdr, CDentry *srcdn, version_t srcdnpv,
 			       CDentry *destdn, CDentry *staydn, bool finish_mdr);
 
-  //Cor-FS
-  void corefs_print_xattrs(CInode *in);
-  char* corefs_get_xattrs(CInode *cin);
-  int corefs_get_correlations(CInode *target, char** c);
-  CInode *corefs_prefetch_cinode(char* filename);
-  void corefs_handle_client_feedback(MDRequestRef& mdr);
-  float corefs_get_dc_score(CInode *in, string filename);
-  void corefs_add_dc_score(CInode *in, string filename);
-
-
-  public:
-  int mon_req[OP_NUM];
-  int mon_op[OP_NUM];
-  // int max_phd_items;
-  // corefs
-  void mon_req_init();
-  static void* count_load_thread(void* args);
-  
+  // SpeedyMeta
+  float speedymeta_get_dcscore(CInode *cin, string path);
+  float speedymeta_add_dcscore(CInode *cin, string path, float d_score);
+  void speedymeta_prefetch(MDRequestRef& mdr, CInode *ref);
+  int speedymeta_batch_reply(MDRequestRef& mdr, bufferlist *bl, Session *session, snapid_t snapid);
+  #ifdef _SPEEDYMETA_FEEDBACK
+  void speedymeta_handle_client_feedback(MDRequestRef& mdr);
+  #endif
 private:
   void reply_client_request(MDRequestRef& mdr, MClientReply *reply);
 };

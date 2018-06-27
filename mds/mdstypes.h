@@ -9,13 +9,14 @@
 #include <ostream>
 #include <set>
 #include <map>
+#include <boost/utility/string_view.hpp>
 
 #include "common/config.h"
 #include "common/Clock.h"
 #include "common/DecayCounter.h"
 #include "common/entity_name.h"
-#include "MDSContext.h"
 
+#include "include/Context.h"
 #include "include/frag.h"
 #include "include/xlist.h"
 #include "include/interval_set.h"
@@ -31,11 +32,6 @@
 #include <boost/serialization/strong_typedef.hpp>
 
 #define CEPH_FS_ONDISK_MAGIC "ceph fs volume v011"
-
-
-#define MDS_REF_SET      // define me for improved debug output, sanity checking
-//#define MDS_AUTHPIN_SET  // define me for debugging auth pin leaks
-//#define MDS_VERIFY_FRAGSTAT    // do do (slow) sanity checking on frags
 
 #define MDS_PORT_CACHE   0x200
 #define MDS_PORT_LOCKER  0x300
@@ -57,6 +53,7 @@
 #define MDS_INO_LOG_OFFSET        (2*MAX_MDS)
 #define MDS_INO_LOG_BACKUP_OFFSET (3*MAX_MDS)
 #define MDS_INO_LOG_POINTER_OFFSET    (4*MAX_MDS)
+#define MDS_INO_PURGE_QUEUE       (5*MAX_MDS)
 
 #define MDS_INO_SYSTEM_BASE       ((6*MAX_MDS) + (MAX_MDS * NUM_STRAY))
 
@@ -77,8 +74,6 @@
 
 typedef int32_t mds_rank_t;
 typedef int32_t fs_cluster_id_t;
-
-
 
 BOOST_STRONG_TYPEDEF(uint64_t, mds_gid_t)
 extern const mds_gid_t MDS_GID_NONE;
@@ -116,11 +111,6 @@ class mds_role_t
   }
 };
 std::ostream& operator<<(std::ostream &out, const mds_role_t &role);
-
-
-extern long g_num_ino, g_num_dir, g_num_dn, g_num_cap;
-extern long g_num_inoa, g_num_dira, g_num_dna, g_num_capa;
-extern long g_num_inos, g_num_dirs, g_num_dns, g_num_caps;
 
 
 // CAPS
@@ -162,18 +152,19 @@ inline string ccap_string(int cap)
 
 
 struct scatter_info_t {
-  version_t version;
+  version_t version = 0;
 
-  scatter_info_t() : version(0) {}
+  scatter_info_t() {}
 };
 
 struct frag_info_t : public scatter_info_t {
   // this frag
   utime_t mtime;
-  int64_t nfiles;        // files
-  int64_t nsubdirs;      // subdirs
+  uint64_t change_attr = 0;
+  int64_t nfiles = 0;        // files
+  int64_t nsubdirs = 0;      // subdirs
 
-  frag_info_t() : nfiles(0), nsubdirs(0) {}
+  frag_info_t() {}
 
   int64_t size() const { return nfiles + nsubdirs; }
 
@@ -182,10 +173,16 @@ struct frag_info_t : public scatter_info_t {
   }
 
   // *this += cur - acc;
-  void add_delta(const frag_info_t &cur, frag_info_t &acc, bool& touched_mtime) {
-    if (!(cur.mtime == acc.mtime)) {
+  void add_delta(const frag_info_t &cur, const frag_info_t &acc, bool *touched_mtime=0, bool *touched_chattr=0) {
+    if (cur.mtime > mtime) {
       mtime = cur.mtime;
-      touched_mtime = true;
+      if (touched_mtime)
+	*touched_mtime = true;
+    }
+    if (cur.change_attr > change_attr) {
+      change_attr = cur.change_attr;
+      if (touched_chattr)
+	*touched_chattr = true;
     }
     nfiles += cur.nfiles - acc.nfiles;
     nsubdirs += cur.nsubdirs - acc.nsubdirs;
@@ -194,6 +191,8 @@ struct frag_info_t : public scatter_info_t {
   void add(const frag_info_t& other) {
     if (other.mtime > mtime)
       mtime = other.mtime;
+    if (other.change_attr > change_attr)
+      change_attr = other.change_attr;
     nfiles += other.nfiles;
     nsubdirs += other.nsubdirs;
   }
@@ -214,6 +213,9 @@ WRITE_CLASS_ENCODER(frag_info_t)
 inline bool operator==(const frag_info_t &l, const frag_info_t &r) {
   return memcmp(&l, &r, sizeof(l)) == 0;
 }
+inline bool operator!=(const frag_info_t &l, const frag_info_t &r) {
+  return !(l == r);
+}
 
 std::ostream& operator<<(std::ostream &out, const frag_info_t &f);
 
@@ -221,14 +223,14 @@ std::ostream& operator<<(std::ostream &out, const frag_info_t &f);
 struct nest_info_t : public scatter_info_t {
   // this frag + children
   utime_t rctime;
-  int64_t rbytes;
-  int64_t rfiles;
-  int64_t rsubdirs;
+  int64_t rbytes = 0;
+  int64_t rfiles = 0;
+  int64_t rsubdirs = 0;
   int64_t rsize() const { return rfiles + rsubdirs; }
 
-  int64_t rsnaprealms;
+  int64_t rsnaprealms = 0;
 
-  nest_info_t() : rbytes(0), rfiles(0), rsubdirs(0), rsnaprealms(0) {}
+  nest_info_t() {}
 
   void zero() {
     *this = nest_info_t();
@@ -247,7 +249,7 @@ struct nest_info_t : public scatter_info_t {
   }
 
   // *this += cur - acc;
-  void add_delta(const nest_info_t &cur, nest_info_t &acc) {
+  void add_delta(const nest_info_t &cur, const nest_info_t &acc) {
     if (cur.rctime > rctime)
       rctime = cur.rctime;
     rbytes += cur.rbytes - acc.rbytes;
@@ -273,6 +275,9 @@ WRITE_CLASS_ENCODER(nest_info_t)
 
 inline bool operator==(const nest_info_t &l, const nest_info_t &r) {
   return memcmp(&l, &r, sizeof(l)) == 0;
+}
+inline bool operator!=(const nest_info_t &l, const nest_info_t &r) {
+  return !(l == r);
 }
 
 std::ostream& operator<<(std::ostream &out, const nest_info_t &n);
@@ -309,10 +314,10 @@ inline bool operator<(const vinodeno_t &l, const vinodeno_t &r) {
 
 struct quota_info_t
 {
-  int64_t max_bytes;
-  int64_t max_files;
+  int64_t max_bytes = 0;
+  int64_t max_files = 0;
  
-  quota_info_t() : max_bytes(0), max_files(0) {}
+  quota_info_t() {}
 
   void encode(bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -373,19 +378,19 @@ inline std::ostream& operator<<(std::ostream &out, const vinodeno_t &vino) {
  */
 struct client_writeable_range_t {
   struct byte_range_t {
-    uint64_t first, last;    // interval client can write to
-    byte_range_t() : first(0), last(0) {}
+    uint64_t first = 0, last = 0;    // interval client can write to
+    byte_range_t() {}
   };
 
   byte_range_t range;
-  snapid_t follows;     // aka "data+metadata flushed thru"
+  snapid_t follows = 0;     // aka "data+metadata flushed thru"
 
-  client_writeable_range_t() : follows(0) {}
+  client_writeable_range_t() {}
 
   void encode(bufferlist &bl) const;
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
-  static void generate_test_instances(list<client_writeable_range_t*>& ls);
+  static void generate_test_instances(std::list<client_writeable_range_t*>& ls);
 };
 
 inline void decode(client_writeable_range_t::byte_range_t& range, bufferlist::iterator& bl) {
@@ -405,28 +410,24 @@ inline bool operator==(const client_writeable_range_t& l,
 
 struct inline_data_t {
 private:
-  bufferlist *blp;
+  std::unique_ptr<bufferlist> blp;
 public:
-  version_t version;
+  version_t version = 1;
 
   void free_data() {
-    delete blp;
-    blp = NULL;
+    blp.reset();
   }
   bufferlist& get_data() {
     if (!blp)
-      blp = new bufferlist;
+      blp.reset(new bufferlist);
     return *blp;
   }
   size_t length() const { return blp ? blp->length() : 0; }
 
-  inline_data_t() : blp(0), version(1) {}
-  inline_data_t(const inline_data_t& o) : blp(0), version(o.version) {
+  inline_data_t() {}
+  inline_data_t(const inline_data_t& o) : version(o.version) {
     if (o.blp)
       get_data() = *o.blp;
-  }
-  ~inline_data_t() {
-    free_data();
   }
   inline_data_t& operator=(const inline_data_t& o) {
     version = o.version;
@@ -439,7 +440,7 @@ public:
   bool operator==(const inline_data_t& o) const {
    return length() == o.length() &&
 	  (length() == 0 ||
-	   (*const_cast<bufferlist*>(blp) == *const_cast<bufferlist*>(o.blp)));
+	   (*const_cast<bufferlist*>(blp.get()) == *const_cast<bufferlist*>(o.blp.get())));
   }
   bool operator!=(const inline_data_t& o) const {
     return !(*this == o);
@@ -459,6 +460,7 @@ typedef uint32_t damage_flags_t;
 /*
  * inode_t
  */
+template<template<typename> class Allocator = std::allocator>
 struct inode_t {
   /**
    * ***************
@@ -466,35 +468,40 @@ struct inode_t {
    * ***************
    */
   // base (immutable)
-  inodeno_t ino;
-  uint32_t   rdev;    // if special file
+  inodeno_t ino = 0;
+  uint32_t   rdev = 0;    // if special file
 
   // affected by any inode change...
   utime_t    ctime;   // inode change time
+  utime_t    btime;   // birth time
 
   // perm (namespace permissions)
-  uint32_t   mode;
-  uid_t      uid;
-  gid_t      gid;
+  uint32_t   mode = 0;
+  uid_t      uid = 0;
+  gid_t      gid = 0;
 
   // nlink
-  int32_t    nlink;  
+  int32_t    nlink = 0;
 
   // file (data access)
   ceph_dir_layout  dir_layout;    // [dir only]
   file_layout_t layout;
-  compact_set <int64_t> old_pools;
-  uint64_t   size;        // on directory, # dentries
-  uint64_t   max_size_ever; // max size the file has ever been
-  uint32_t   truncate_seq;
-  uint64_t   truncate_size, truncate_from;
-  uint32_t   truncate_pending;
+  compact_set<int64_t, std::less<int64_t>, Allocator<int64_t>> old_pools;
+  uint64_t   size = 0;        // on directory, # dentries
+  uint64_t   max_size_ever = 0; // max size the file has ever been
+  uint32_t   truncate_seq = 0;
+  uint64_t   truncate_size = 0, truncate_from = 0;
+  uint32_t   truncate_pending = 0;
   utime_t    mtime;   // file data modify time.
   utime_t    atime;   // file data access time.
-  uint32_t   time_warp_seq;  // count of (potential) mtime/atime timewarps (i.e., utimes())
-  inline_data_t inline_data;
+  uint32_t   time_warp_seq = 0;  // count of (potential) mtime/atime timewarps (i.e., utimes())
+  inline_data_t inline_data; // FIXME check
 
-  std::map<client_t,client_writeable_range_t> client_ranges;  // client(s) can write to these ranges
+  // change attribute
+  uint64_t   change_attr = 0;
+
+  using client_range_map = std::map<client_t,client_writeable_range_t,std::less<client_t>,Allocator<std::pair<const client_t,client_writeable_range_t>>>;
+  client_range_map client_ranges;  // client(s) can write to these ranges
 
   // dirfrag, recursive accountin
   frag_info_t dirstat;         // protected by my filelock
@@ -502,29 +509,25 @@ struct inode_t {
   nest_info_t accounted_rstat; // protected by parent's nestlock
 
   quota_info_t quota;
+
+  mds_rank_t export_pin = MDS_RANK_NONE;
  
   // special stuff
-  version_t version;           // auth only
-  version_t file_data_version; // auth only
-  version_t xattr_version;
+  version_t version = 0;           // auth only
+  version_t file_data_version = 0; // auth only
+  version_t xattr_version = 0;
 
   utime_t last_scrub_stamp;    // start time of last complete scrub
-  version_t last_scrub_version;// (parent) start version of last complete scrub
+  version_t last_scrub_version = 0;// (parent) start version of last complete scrub
 
-  version_t backtrace_version;
+  version_t backtrace_version = 0;
 
   snapid_t oldest_snap;
 
-  string stray_prior_path; //stores path before unlink
+  std::basic_string<char,std::char_traits<char>,Allocator<char>> stray_prior_path; //stores path before unlink
 
-  inode_t() : ino(0), rdev(0),
-	      mode(0), uid(0), gid(0), nlink(0),
-	      size(0), max_size_ever(0),
-	      truncate_seq(0), truncate_size(0), truncate_from(0),
-	      truncate_pending(0),
-	      time_warp_seq(0),
-	      version(0), file_data_version(0), xattr_version(0),
-	      last_scrub_version(0), backtrace_version(0) {
+  inode_t()
+  {
     clear_layout();
     memset(&dir_layout, 0, sizeof(dir_layout));
     memset(&quota, 0, sizeof(quota));
@@ -556,7 +559,7 @@ struct inode_t {
     layout = file_layout_t();
   }
 
-  uint64_t get_layout_size_increment() {
+  uint64_t get_layout_size_increment() const {
     return layout.get_period();
   }
 
@@ -607,7 +610,7 @@ struct inode_t {
   void encode(bufferlist &bl, uint64_t features) const;
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
-  static void generate_test_instances(list<inode_t*>& ls);
+  static void generate_test_instances(std::list<inode_t*>& ls);
   /**
    * Compare this inode_t with another that represent *the same inode*
    * at different points in time.
@@ -624,48 +627,416 @@ struct inode_t {
 private:
   bool older_is_consistent(const inode_t &other) const;
 };
-WRITE_CLASS_ENCODER_FEATURES(inode_t)
 
+// These methods may be moved back to mdstypes.cc when we have pmr
+template<template<typename> class Allocator>
+void inode_t<Allocator>::encode(bufferlist &bl, uint64_t features) const
+{
+  ENCODE_START(15, 6, bl);
+
+  ::encode(ino, bl);
+  ::encode(rdev, bl);
+  ::encode(ctime, bl);
+
+  ::encode(mode, bl);
+  ::encode(uid, bl);
+  ::encode(gid, bl);
+
+  ::encode(nlink, bl);
+  {
+    // removed field
+    bool anchored = 0;
+    ::encode(anchored, bl);
+  }
+
+  ::encode(dir_layout, bl);
+  ::encode(layout, bl, features);
+  ::encode(size, bl);
+  ::encode(truncate_seq, bl);
+  ::encode(truncate_size, bl);
+  ::encode(truncate_from, bl);
+  ::encode(truncate_pending, bl);
+  ::encode(mtime, bl);
+  ::encode(atime, bl);
+  ::encode(time_warp_seq, bl);
+  ::encode(client_ranges, bl);
+
+  ::encode(dirstat, bl);
+  ::encode(rstat, bl);
+  ::encode(accounted_rstat, bl);
+
+  ::encode(version, bl);
+  ::encode(file_data_version, bl);
+  ::encode(xattr_version, bl);
+  ::encode(backtrace_version, bl);
+  ::encode(old_pools, bl);
+  ::encode(max_size_ever, bl);
+  ::encode(inline_data, bl);
+  ::encode(quota, bl);
+
+  ::encode(stray_prior_path, bl);
+
+  ::encode(last_scrub_version, bl);
+  ::encode(last_scrub_stamp, bl);
+
+  ::encode(btime, bl);
+  ::encode(change_attr, bl);
+
+  ::encode(export_pin, bl);
+
+  ENCODE_FINISH(bl);
+}
+
+template<template<typename> class Allocator>
+void inode_t<Allocator>::decode(bufferlist::iterator &p)
+{
+  DECODE_START_LEGACY_COMPAT_LEN(15, 6, 6, p);
+
+  ::decode(ino, p);
+  ::decode(rdev, p);
+  ::decode(ctime, p);
+
+  ::decode(mode, p);
+  ::decode(uid, p);
+  ::decode(gid, p);
+
+  ::decode(nlink, p);
+  {
+    bool anchored;
+    ::decode(anchored, p);
+  }
+
+  if (struct_v >= 4)
+    ::decode(dir_layout, p);
+  else
+    memset(&dir_layout, 0, sizeof(dir_layout));
+  ::decode(layout, p);
+  ::decode(size, p);
+  ::decode(truncate_seq, p);
+  ::decode(truncate_size, p);
+  ::decode(truncate_from, p);
+  if (struct_v >= 5)
+    ::decode(truncate_pending, p);
+  else
+    truncate_pending = 0;
+  ::decode(mtime, p);
+  ::decode(atime, p);
+  ::decode(time_warp_seq, p);
+  if (struct_v >= 3) {
+    ::decode(client_ranges, p);
+  } else {
+    map<client_t, client_writeable_range_t::byte_range_t> m;
+    ::decode(m, p);
+    for (map<client_t, client_writeable_range_t::byte_range_t>::iterator
+	q = m.begin(); q != m.end(); ++q)
+      client_ranges[q->first].range = q->second;
+  }
+
+  ::decode(dirstat, p);
+  ::decode(rstat, p);
+  ::decode(accounted_rstat, p);
+
+  ::decode(version, p);
+  ::decode(file_data_version, p);
+  ::decode(xattr_version, p);
+  if (struct_v >= 2)
+    ::decode(backtrace_version, p);
+  if (struct_v >= 7)
+    ::decode(old_pools, p);
+  if (struct_v >= 8)
+    ::decode(max_size_ever, p);
+  if (struct_v >= 9) {
+    ::decode(inline_data, p);
+  } else {
+    inline_data.version = CEPH_INLINE_NONE;
+  }
+  if (struct_v < 10)
+    backtrace_version = 0; // force update backtrace
+  if (struct_v >= 11)
+    ::decode(quota, p);
+
+  if (struct_v >= 12) {
+    std::string tmp;
+    ::decode(tmp, p);
+    stray_prior_path = std::basic_string<char,std::char_traits<char>,Allocator<char>>(boost::string_view(tmp));
+  }
+
+  if (struct_v >= 13) {
+    ::decode(last_scrub_version, p);
+    ::decode(last_scrub_stamp, p);
+  }
+  if (struct_v >= 14) {
+    ::decode(btime, p);
+    ::decode(change_attr, p);
+  } else {
+    btime = utime_t();
+    change_attr = 0;
+  }
+
+  if (struct_v >= 15) {
+    ::decode(export_pin, p);
+  } else {
+    export_pin = MDS_RANK_NONE;
+  }
+
+  DECODE_FINISH(p);
+}
+
+template<template<typename> class Allocator>
+void inode_t<Allocator>::dump(Formatter *f) const
+{
+  f->dump_unsigned("ino", ino);
+  f->dump_unsigned("rdev", rdev);
+  f->dump_stream("ctime") << ctime;
+  f->dump_stream("btime") << btime;
+  f->dump_unsigned("mode", mode);
+  f->dump_unsigned("uid", uid);
+  f->dump_unsigned("gid", gid);
+  f->dump_unsigned("nlink", nlink);
+
+  f->open_object_section("dir_layout");
+  ::dump(dir_layout, f);
+  f->close_section();
+
+  f->dump_object("layout", layout);
+
+  f->open_array_section("old_pools");
+  for (const auto &p : old_pools) {
+    f->dump_int("pool", p);
+  }
+  f->close_section();
+
+  f->dump_unsigned("size", size);
+  f->dump_unsigned("truncate_seq", truncate_seq);
+  f->dump_unsigned("truncate_size", truncate_size);
+  f->dump_unsigned("truncate_from", truncate_from);
+  f->dump_unsigned("truncate_pending", truncate_pending);
+  f->dump_stream("mtime") << mtime;
+  f->dump_stream("atime") << atime;
+  f->dump_unsigned("time_warp_seq", time_warp_seq);
+  f->dump_unsigned("change_attr", change_attr);
+  f->dump_int("export_pin", export_pin);
+
+  f->open_array_section("client_ranges");
+  for (const auto &p : client_ranges) {
+    f->open_object_section("client");
+    f->dump_unsigned("client", p.first.v);
+    p.second.dump(f);
+    f->close_section();
+  }
+  f->close_section();
+
+  f->open_object_section("dirstat");
+  dirstat.dump(f);
+  f->close_section();
+
+  f->open_object_section("rstat");
+  rstat.dump(f);
+  f->close_section();
+
+  f->open_object_section("accounted_rstat");
+  accounted_rstat.dump(f);
+  f->close_section();
+
+  f->dump_unsigned("version", version);
+  f->dump_unsigned("file_data_version", file_data_version);
+  f->dump_unsigned("xattr_version", xattr_version);
+  f->dump_unsigned("backtrace_version", backtrace_version);
+
+  f->dump_string("stray_prior_path", stray_prior_path);
+}
+
+template<template<typename> class Allocator>
+void inode_t<Allocator>::generate_test_instances(list<inode_t*>& ls)
+{
+  ls.push_back(new inode_t<Allocator>);
+  ls.push_back(new inode_t<Allocator>);
+  ls.back()->ino = 1;
+  // i am lazy.
+}
+
+template<template<typename> class Allocator>
+int inode_t<Allocator>::compare(const inode_t<Allocator> &other, bool *divergent) const
+{
+  assert(ino == other.ino);
+  *divergent = false;
+  if (version == other.version) {
+    if (rdev != other.rdev ||
+        ctime != other.ctime ||
+        btime != other.btime ||
+        mode != other.mode ||
+        uid != other.uid ||
+        gid != other.gid ||
+        nlink != other.nlink ||
+        memcmp(&dir_layout, &other.dir_layout, sizeof(dir_layout)) ||
+        layout != other.layout ||
+        old_pools != other.old_pools ||
+        size != other.size ||
+        max_size_ever != other.max_size_ever ||
+        truncate_seq != other.truncate_seq ||
+        truncate_size != other.truncate_size ||
+        truncate_from != other.truncate_from ||
+        truncate_pending != other.truncate_pending ||
+	change_attr != other.change_attr ||
+        mtime != other.mtime ||
+        atime != other.atime ||
+        time_warp_seq != other.time_warp_seq ||
+        inline_data != other.inline_data ||
+        client_ranges != other.client_ranges ||
+        !(dirstat == other.dirstat) ||
+        !(rstat == other.rstat) ||
+        !(accounted_rstat == other.accounted_rstat) ||
+        file_data_version != other.file_data_version ||
+        xattr_version != other.xattr_version ||
+        backtrace_version != other.backtrace_version) {
+      *divergent = true;
+    }
+    return 0;
+  } else if (version > other.version) {
+    *divergent = !older_is_consistent(other);
+    return 1;
+  } else {
+    assert(version < other.version);
+    *divergent = !other.older_is_consistent(*this);
+    return -1;
+  }
+}
+
+template<template<typename> class Allocator>
+bool inode_t<Allocator>::older_is_consistent(const inode_t<Allocator> &other) const
+{
+  if (max_size_ever < other.max_size_ever ||
+      truncate_seq < other.truncate_seq ||
+      time_warp_seq < other.time_warp_seq ||
+      inline_data.version < other.inline_data.version ||
+      dirstat.version < other.dirstat.version ||
+      rstat.version < other.rstat.version ||
+      accounted_rstat.version < other.accounted_rstat.version ||
+      file_data_version < other.file_data_version ||
+      xattr_version < other.xattr_version ||
+      backtrace_version < other.backtrace_version) {
+    return false;
+  }
+  return true;
+}
+
+template<template<typename> class Allocator>
+inline void encode(const inode_t<Allocator> &c, ::ceph::bufferlist &bl, uint64_t features)
+{
+  ENCODE_DUMP_PRE();
+  c.encode(bl, features);
+  ENCODE_DUMP_POST(cl);
+}
+template<template<typename> class Allocator>
+inline void decode(inode_t<Allocator> &c, ::ceph::bufferlist::iterator &p)
+{
+  c.decode(p);
+}
+
+template<template<typename> class Allocator>
+using alloc_string = std::basic_string<char,std::char_traits<char>,Allocator<char>>;
+
+template<template<typename> class Allocator>
+using xattr_map = compact_map<alloc_string<Allocator>, bufferptr, std::less<alloc_string<Allocator>>, Allocator<std::pair<const alloc_string<Allocator>, bufferptr>>>; // FIXME bufferptr not in mempool
 
 /*
  * old_inode_t
  */
+template<template<typename> class Allocator = std::allocator>
 struct old_inode_t {
   snapid_t first;
-  inode_t inode;
-  std::map<string,bufferptr> xattrs;
+  inode_t<Allocator> inode;
+  xattr_map<Allocator> xattrs;
 
   void encode(bufferlist &bl, uint64_t features) const;
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
-  static void generate_test_instances(list<old_inode_t*>& ls);
+  static void generate_test_instances(std::list<old_inode_t*>& ls);
 };
-WRITE_CLASS_ENCODER_FEATURES(old_inode_t)
+
+// These methods may be moved back to mdstypes.cc when we have pmr
+template<template<typename> class Allocator>
+void old_inode_t<Allocator>::encode(bufferlist& bl, uint64_t features) const
+{
+  ENCODE_START(2, 2, bl);
+  ::encode(first, bl);
+  ::encode(inode, bl, features);
+  ::encode(xattrs, bl);
+  ENCODE_FINISH(bl);
+}
+
+template<template<typename> class Allocator>
+void old_inode_t<Allocator>::decode(bufferlist::iterator& bl)
+{
+  DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
+  ::decode(first, bl);
+  ::decode(inode, bl);
+  ::decode(xattrs, bl);
+  DECODE_FINISH(bl);
+}
+
+template<template<typename> class Allocator>
+void old_inode_t<Allocator>::dump(Formatter *f) const
+{
+  f->dump_unsigned("first", first);
+  inode.dump(f);
+  f->open_object_section("xattrs");
+  for (const auto &p : xattrs) {
+    std::string v(p.second.c_str(), p.second.length());
+    f->dump_string(p.first.c_str(), v);
+  }
+  f->close_section();
+}
+
+template<template<typename> class Allocator>
+void old_inode_t<Allocator>::generate_test_instances(std::list<old_inode_t<Allocator>*>& ls)
+{
+  ls.push_back(new old_inode_t<Allocator>);
+  ls.push_back(new old_inode_t<Allocator>);
+  ls.back()->first = 2;
+  std::list<inode_t<Allocator>*> ils;
+  inode_t<Allocator>::generate_test_instances(ils);
+  ls.back()->inode = *ils.back();
+  ls.back()->xattrs["user.foo"] = buffer::copy("asdf", 4);
+  ls.back()->xattrs["user.unprintable"] = buffer::copy("\000\001\002", 3);
+}
+
+template<template<typename> class Allocator>
+inline void encode(const old_inode_t<Allocator> &c, ::ceph::bufferlist &bl, uint64_t features)
+{
+  ENCODE_DUMP_PRE();
+  c.encode(bl, features);
+  ENCODE_DUMP_POST(cl);
+}
+template<template<typename> class Allocator>
+inline void decode(old_inode_t<Allocator> &c, ::ceph::bufferlist::iterator &p)
+{
+  c.decode(p);
+}
 
 
 /*
  * like an inode, but for a dir frag 
  */
 struct fnode_t {
-  version_t version;
+  version_t version = 0;
   snapid_t snap_purged_thru;   // the max_last_destroy snapid we've been purged thru
   frag_info_t fragstat, accounted_fragstat;
   nest_info_t rstat, accounted_rstat;
-  damage_flags_t damage_flags;
+  damage_flags_t damage_flags = 0;
 
   // we know we and all our descendants have been scrubbed since this version
-  version_t recursive_scrub_version;
+  version_t recursive_scrub_version = 0;
   utime_t recursive_scrub_stamp;
   // version at which we last scrubbed our personal data structures
-  version_t localized_scrub_version;
+  version_t localized_scrub_version = 0;
   utime_t localized_scrub_stamp;
 
   void encode(bufferlist &bl) const;
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
   static void generate_test_instances(list<fnode_t*>& ls);
-  fnode_t() : version(0), damage_flags(0),
-	      recursive_scrub_version(0), localized_scrub_version(0) {}
+  fnode_t() {}
 };
 WRITE_CLASS_ENCODER(fnode_t)
 
@@ -700,6 +1071,7 @@ struct session_info_t {
   EntityName auth_name;
 
   client_t get_client() const { return client_t(inst.name.num()); }
+  const entity_name_t& get_source() const { return inst.name; }
 
   void clear_meta() {
     prealloc_inos.clear();
@@ -708,26 +1080,26 @@ struct session_info_t {
     completed_flushes.clear();
   }
 
-  void encode(bufferlist& bl) const;
+  void encode(bufferlist& bl, uint64_t features) const;
   void decode(bufferlist::iterator& p);
   void dump(Formatter *f) const;
   static void generate_test_instances(list<session_info_t*>& ls);
 };
-WRITE_CLASS_ENCODER(session_info_t)
+WRITE_CLASS_ENCODER_FEATURES(session_info_t)
 
 
 // =======
 // dentries
 
 struct dentry_key_t {
-  snapid_t snapid;
-  const char *name;
-  __u32 hash;
-  dentry_key_t() : snapid(0), name(0), hash(0) {}
-  dentry_key_t(snapid_t s, const char *n, __u32 h=0) :
+  snapid_t snapid = 0;
+  boost::string_view name;
+  __u32 hash = 0;
+  dentry_key_t() {}
+  dentry_key_t(snapid_t s, boost::string_view n, __u32 h=0) :
     snapid(s), name(n), hash(h) {}
 
-  bool is_valid() { return name || snapid; }
+  bool is_valid() { return name.length() || snapid; }
 
   // encode into something that can be decoded as a string.
   // name_ (head) or name_%x (!head)
@@ -753,19 +1125,20 @@ struct dentry_key_t {
     ::decode(key, bl);
     decode_helper(key, nm, sn);
   }
-  static void decode_helper(const string& key, string& nm, snapid_t& sn) {
+  static void decode_helper(boost::string_view key, string& nm, snapid_t& sn) {
     size_t i = key.find_last_of('_');
     assert(i != string::npos);
-    if (key.compare(i+1, string::npos, "head") == 0) {
+    if (key.compare(i+1, boost::string_view::npos, "head") == 0) {
       // name_head
       sn = CEPH_NOSNAP;
     } else {
       // name_%x
       long long unsigned x = 0;
-      sscanf(key.c_str() + i + 1, "%llx", &x);
+      std::string x_str(key.substr(i+1));
+      sscanf(x_str.c_str(), "%llx", &x);
       sn = x;
     }  
-    nm = string(key.c_str(), i);
+    nm = std::string(key.substr(0, i));
   }
 };
 
@@ -782,7 +1155,7 @@ inline bool operator<(const dentry_key_t& k1, const dentry_key_t& k2)
   int c = ceph_frag_value(k1.hash) - ceph_frag_value(k2.hash);
   if (c)
     return c < 0;
-  c = strcmp(k1.name, k2.name);
+  c = k1.name.compare(k2.name);
   if (c)
     return c < 0;
   return k1.snapid < k2.snapid;
@@ -796,7 +1169,7 @@ struct string_snap_t {
   string name;
   snapid_t snapid;
   string_snap_t() {}
-  string_snap_t(const string& n, snapid_t s) : name(n), snapid(s) {}
+  string_snap_t(boost::string_view n, snapid_t s) : name(n), snapid(s) {}
   string_snap_t(const char *n, snapid_t s) : name(n), snapid(s) {}
 
   void encode(bufferlist& bl) const;
@@ -807,7 +1180,7 @@ struct string_snap_t {
 WRITE_CLASS_ENCODER(string_snap_t)
 
 inline bool operator<(const string_snap_t& l, const string_snap_t& r) {
-  int c = strcmp(l.name.c_str(), r.name.c_str());
+  int c = l.name.compare(r.name);
   return c < 0 || (c == 0 && l.snapid < r.snapid);
 }
 
@@ -823,10 +1196,10 @@ inline std::ostream& operator<<(std::ostream& out, const string_snap_t &k)
  * pending mutation state in the table.
  */
 struct mds_table_pending_t {
-  uint64_t reqid;
-  __s32 mds;
-  version_t tid;
-  mds_table_pending_t() : reqid(0), mds(0), tid(0) {}
+  uint64_t reqid = 0;
+  __s32 mds = 0;
+  version_t tid = 0;
+  mds_table_pending_t() {}
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
@@ -840,8 +1213,8 @@ WRITE_CLASS_ENCODER(mds_table_pending_t)
 
 struct metareqid_t {
   entity_name_t name;
-  uint64_t tid;
-  metareqid_t() : tid(0) {}
+  uint64_t tid = 0;
+  metareqid_t() {}
   metareqid_t(entity_name_t n, ceph_tid_t t) : name(n), tid(t) {}
   void encode(bufferlist& bl) const {
     ::encode(name, bl);
@@ -896,7 +1269,7 @@ struct cap_reconnect_t {
     memset(&capinfo, 0, sizeof(capinfo));
     snap_follows = 0;
   }
-  cap_reconnect_t(uint64_t cap_id, inodeno_t pino, const string& p, int w, int i,
+  cap_reconnect_t(uint64_t cap_id, inodeno_t pino, boost::string_view p, int w, int i,
 		  inodeno_t sr, snapid_t sf, bufferlist& lb) :
     path(p) {
     capinfo.cap_id = cap_id;
@@ -971,10 +1344,10 @@ WRITE_CLASS_ENCODER(old_cap_reconnect_t)
 // dir frag
 
 struct dirfrag_t {
-  inodeno_t ino;
+  inodeno_t ino = 0;
   frag_t    frag;
 
-  dirfrag_t() : ino(0) { }
+  dirfrag_t() {}
   dirfrag_t(inodeno_t i, frag_t f) : ino(i), frag(f) { }
 
   void encode(bufferlist& bl) const {
@@ -1026,15 +1399,13 @@ namespace std {
 
 class inode_load_vec_t {
   static const int NUM = 2;
-  std::vector < DecayCounter > vec;
+  std::array<DecayCounter, NUM> vec;
 public:
   explicit inode_load_vec_t(const utime_t &now)
-     : vec(NUM, DecayCounter(now))
+     : vec{DecayCounter(now), DecayCounter(now)}
   {}
   // for dencoder infrastructure
-  inode_load_vec_t() :
-    vec(NUM, DecayCounter())
-  {}
+  inode_load_vec_t() {}
   DecayCounter &get(int t) { 
     assert(t < NUM);
     return vec[t]; 
@@ -1054,28 +1425,39 @@ inline void encode(const inode_load_vec_t &c, bufferlist &bl) { c.encode(bl); }
 inline void decode(inode_load_vec_t & c, const utime_t &t, bufferlist::iterator &p) {
   c.decode(t, p);
 }
+// for dencoder
+inline void decode(inode_load_vec_t & c, bufferlist::iterator &p) {
+  utime_t sample;
+  c.decode(sample, p);
+}
 
 class dirfrag_load_vec_t {
 public:
   static const int NUM = 5;
-  std::vector < DecayCounter > vec;
+  std::array<DecayCounter, NUM> vec;
   explicit dirfrag_load_vec_t(const utime_t &now)
-     : vec(NUM, DecayCounter(now))
-  { }
-  // for dencoder infrastructure
-  dirfrag_load_vec_t()
-    : vec(NUM, DecayCounter())
+     : vec{
+         DecayCounter(now),
+         DecayCounter(now),
+         DecayCounter(now),
+         DecayCounter(now),
+         DecayCounter(now)
+       }
   {}
+  // for dencoder infrastructure
+  dirfrag_load_vec_t() {}
   void encode(bufferlist &bl) const {
     ENCODE_START(2, 2, bl);
-    for (int i=0; i<NUM; i++)
-      ::encode(vec[i], bl);
+    for (const auto &i : vec) {
+      ::encode(i, bl);
+    }
     ENCODE_FINISH(bl);
   }
   void decode(const utime_t &t, bufferlist::iterator &p) {
     DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, p);
-    for (int i=0; i<NUM; i++)
-      ::decode(vec[i], t, p);
+    for (auto &i : vec) {
+      ::decode(i, t, p);
+    }
     DECODE_FINISH(p);
   }
   // for dencoder infrastructure
@@ -1091,12 +1473,14 @@ public:
     return vec[t]; 
   }
   void adjust(utime_t now, const DecayRate& rate, double d) {
-    for (int i=0; i<NUM; i++) 
-      vec[i].adjust(now, rate, d);
+    for (auto &i : vec) {
+      i.adjust(now, rate, d);
+    }
   }
   void zero(utime_t now) {
-    for (int i=0; i<NUM; i++) 
-      vec[i].reset(now);
+    for (auto &i : vec) {
+      i.reset(now);
+    }
   }
   double meta_load(utime_t now, const DecayRate& rate) {
     return 
@@ -1133,11 +1517,16 @@ inline void encode(const dirfrag_load_vec_t &c, bufferlist &bl) { c.encode(bl); 
 inline void decode(dirfrag_load_vec_t& c, const utime_t &t, bufferlist::iterator &p) {
   c.decode(t, p);
 }
+// this for dencoder
+inline void decode(dirfrag_load_vec_t& c, bufferlist::iterator &p) {
+  utime_t sample;
+  c.decode(sample, p);
+}
 
 inline std::ostream& operator<<(std::ostream& out, dirfrag_load_vec_t& dl)
 {
   // ugliness!
-  utime_t now = ceph_clock_now(g_ceph_context);
+  utime_t now = ceph_clock_now();
   DecayRate rate(g_conf->mds_decay_halflife);
   return out << "[" << dl.vec[0].get(now, rate) << "," << dl.vec[1].get(now, rate) 
 	     << " " << dl.meta_load(now, rate)
@@ -1157,21 +1546,15 @@ struct mds_load_t {
   dirfrag_load_vec_t auth;
   dirfrag_load_vec_t all;
 
-  double req_rate;
-  double cache_hit_rate;
-  double queue_len;
+  double req_rate = 0.0;
+  double cache_hit_rate = 0.0;
+  double queue_len = 0.0;
 
-  double cpu_load_avg;
+  double cpu_load_avg = 0.0;
 
-  explicit mds_load_t(const utime_t &t) : 
-    auth(t), all(t), req_rate(0), cache_hit_rate(0),
-    queue_len(0), cpu_load_avg(0)
-  {}
+  explicit mds_load_t(const utime_t &t) : auth(t), all(t) {}
   // mostly for the dencoder infrastructure
-  mds_load_t() :
-    auth(), all(),
-    req_rate(0), cache_hit_rate(0), queue_len(0), cpu_load_avg(0)
-  {}
+  mds_load_t() : auth(), all() {}
   
   double mds_load();  // defiend in MDBalancer.cc
   void encode(bufferlist& bl) const;
@@ -1184,6 +1567,11 @@ struct mds_load_t {
 inline void encode(const mds_load_t &c, bufferlist &bl) { c.encode(bl); }
 inline void decode(mds_load_t &c, const utime_t &t, bufferlist::iterator &p) {
   c.decode(t, p);
+}
+// this one is for dencoder
+inline void decode(mds_load_t &c, bufferlist::iterator &p) {
+  utime_t sample;
+  c.decode(sample, p);
 }
 
 inline std::ostream& operator<<( std::ostream& out, mds_load_t& load )
@@ -1200,11 +1588,11 @@ class load_spread_t {
 public:
   static const int MAX = 4;
   int last[MAX];
-  int p, n;
+  int p = 0, n = 0;
   DecayCounter count;
 
 public:
-  load_spread_t() : p(0), n(0), count(ceph_clock_now(g_ceph_context))
+  load_spread_t() : count(ceph_clock_now())
   {
     for (int i=0; i<MAX; i++)
       last[i] = -1;
@@ -1232,64 +1620,25 @@ public:
 
 
 // ================================================================
-
-//#define MDS_PIN_REPLICATED     1
-//#define MDS_STATE_AUTH     (1<<0)
-
-class MLock;
-class SimpleLock;
-
-class MDSCacheObject;
-
 typedef std::pair<mds_rank_t, mds_rank_t> mds_authority_t;
+
 // -- authority delegation --
 // directory authority types
 //  >= 0 is the auth mds
 #define CDIR_AUTH_PARENT   mds_rank_t(-1)   // default
 #define CDIR_AUTH_UNKNOWN  mds_rank_t(-2)
-#define CDIR_AUTH_DEFAULT   mds_authority_t(CDIR_AUTH_PARENT, CDIR_AUTH_UNKNOWN)
-#define CDIR_AUTH_UNDEF     mds_authority_t(CDIR_AUTH_UNKNOWN, CDIR_AUTH_UNKNOWN)
+#define CDIR_AUTH_DEFAULT  mds_authority_t(CDIR_AUTH_PARENT, CDIR_AUTH_UNKNOWN)
+#define CDIR_AUTH_UNDEF    mds_authority_t(CDIR_AUTH_UNKNOWN, CDIR_AUTH_UNKNOWN)
 //#define CDIR_AUTH_ROOTINODE pair<int,int>( 0, -2)
-
-
-
-/*
- * for metadata leases to clients
- */
-struct ClientLease {
-  client_t client;
-  MDSCacheObject *parent;
-
-  ceph_seq_t seq;
-  utime_t ttl;
-  xlist<ClientLease*>::item item_session_lease; // per-session list
-  xlist<ClientLease*>::item item_lease;         // global list
-
-  ClientLease(client_t c, MDSCacheObject *p) : 
-    client(c), parent(p), seq(0),
-    item_session_lease(this),
-    item_lease(this) { }
-};
-
-
-// print hack
-struct mdsco_db_line_prefix {
-  MDSCacheObject *object;
-  explicit mdsco_db_line_prefix(MDSCacheObject *o) : object(o) {}
-};
-std::ostream& operator<<(std::ostream& out, mdsco_db_line_prefix o);
-
-// printer
-std::ostream& operator<<(std::ostream& out, MDSCacheObject &o);
 
 class MDSCacheObjectInfo {
 public:
-  inodeno_t ino;
+  inodeno_t ino = 0;
   dirfrag_t dirfrag;
   string dname;
   snapid_t snapid;
 
-  MDSCacheObjectInfo() : ino(0) {}
+  MDSCacheObjectInfo() {}
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
@@ -1297,383 +1646,21 @@ public:
   static void generate_test_instances(list<MDSCacheObjectInfo*>& ls);
 };
 
+inline std::ostream& operator<<(std::ostream& out, const MDSCacheObjectInfo &info) {
+  if (info.ino) return out << info.ino << "." << info.snapid;
+  if (info.dname.length()) return out << info.dirfrag << "/" << info.dname
+    << " snap " << info.snapid;
+  return out << info.dirfrag;
+}
+
 inline bool operator==(const MDSCacheObjectInfo& l, const MDSCacheObjectInfo& r) {
   if (l.ino || r.ino)
     return l.ino == r.ino && l.snapid == r.snapid;
   else
     return l.dirfrag == r.dirfrag && l.dname == r.dname;
 }
-
 WRITE_CLASS_ENCODER(MDSCacheObjectInfo)
 
-
-class MDSCacheObject {
- public:
-  // -- pins --
-  const static int PIN_REPLICATED =  1000;
-  const static int PIN_DIRTY      =  1001;
-  const static int PIN_LOCK       = -1002;
-  const static int PIN_REQUEST    = -1003;
-  const static int PIN_WAITER     =  1004;
-  const static int PIN_DIRTYSCATTERED = -1005;
-  static const int PIN_AUTHPIN    =  1006;
-  static const int PIN_PTRWAITER  = -1007;
-  const static int PIN_TEMPEXPORTING = 1008;  // temp pin between encode_ and finish_export
-  static const int PIN_CLIENTLEASE = 1009;
-
-  const char *generic_pin_name(int p) const {
-    switch (p) {
-    case PIN_REPLICATED: return "replicated";
-    case PIN_DIRTY: return "dirty";
-    case PIN_LOCK: return "lock";
-    case PIN_REQUEST: return "request";
-    case PIN_WAITER: return "waiter";
-    case PIN_DIRTYSCATTERED: return "dirtyscattered";
-    case PIN_AUTHPIN: return "authpin";
-    case PIN_PTRWAITER: return "ptrwaiter";
-    case PIN_TEMPEXPORTING: return "tempexporting";
-    case PIN_CLIENTLEASE: return "clientlease";
-    default: assert(0); return 0;
-    }
-  }
-
-  // -- state --
-  const static int STATE_AUTH      = (1<<30);
-  const static int STATE_DIRTY     = (1<<29);
-  const static int STATE_NOTIFYREF = (1<<28); // notify dropping ref drop through _put()
-  const static int STATE_REJOINING = (1<<27);  // replica has not joined w/ primary copy
-  const static int STATE_REJOINUNDEF = (1<<26);  // contents undefined.
-
-
-  // -- wait --
-  const static uint64_t WAIT_ORDERED	 = (1ull<<61);
-  const static uint64_t WAIT_SINGLEAUTH  = (1ull<<60);
-  const static uint64_t WAIT_UNFREEZE    = (1ull<<59); // pka AUTHPINNABLE
-
-
-  // ============================================
-  // cons
- public:
-  MDSCacheObject() :
-    state(0), 
-    ref(0),
-    auth_pins(0), nested_auth_pins(0),
-    replica_nonce(0)
-  {}
-  virtual ~MDSCacheObject() {}
-
-  // printing
-  virtual void print(std::ostream& out) = 0;
-  virtual std::ostream& print_db_line_prefix(std::ostream& out) { 
-    return out << "mdscacheobject(" << this << ") "; 
-  }
-  
-  // --------------------------------------------
-  // state
- protected:
-  __u32 state;     // state bits
-
- public:
-  unsigned get_state() const { return state; }
-  unsigned state_test(unsigned mask) const { return (state & mask); }
-  void state_clear(unsigned mask) { state &= ~mask; }
-  void state_set(unsigned mask) { state |= mask; }
-  void state_reset(unsigned s) { state = s; }
-
-  bool is_auth() const { return state_test(STATE_AUTH); }
-  bool is_dirty() const { return state_test(STATE_DIRTY); }
-  bool is_clean() const { return !is_dirty(); }
-  bool is_rejoining() const { return state_test(STATE_REJOINING); }
-
-  // --------------------------------------------
-  // authority
-  virtual mds_authority_t authority() const = 0;
-  bool is_ambiguous_auth() const {
-    return authority().second != CDIR_AUTH_UNKNOWN;
-  }
-
-  // --------------------------------------------
-  // pins
-protected:
-  __s32      ref;       // reference count
-#ifdef MDS_REF_SET
-  std::map<int,int> ref_map;
-#endif
-
- public:
-  int get_num_ref(int by = -1) const {
-#ifdef MDS_REF_SET
-    if (by >= 0) {
-      if (ref_map.find(by) == ref_map.end()) {
-	return 0;
-      } else {
-        return ref_map.find(by)->second;
-      }
-    }
-#endif
-    return ref;
-  }
-  virtual const char *pin_name(int by) const = 0;
-  //bool is_pinned_by(int by) { return ref_set.count(by); }
-  //multiset<int>& get_ref_set() { return ref_set; }
-
-  virtual void last_put() {}
-  virtual void bad_put(int by) {
-#ifdef MDS_REF_SET
-    assert(ref_map[by] > 0);
-#endif
-    assert(ref > 0);
-  }
-  virtual void _put() {}
-  void put(int by) {
-#ifdef MDS_REF_SET
-    if (ref == 0 || ref_map[by] == 0) {
-#else
-    if (ref == 0) {
-#endif
-      bad_put(by);
-    } else {
-      ref--;
-#ifdef MDS_REF_SET
-      ref_map[by]--;
-#endif
-      if (ref == 0)
-	last_put();
-      if (state_test(STATE_NOTIFYREF))
-	_put();
-    }
-  }
-
-  virtual void first_get() {}
-  virtual void bad_get(int by) {
-#ifdef MDS_REF_SET
-    assert(by < 0 || ref_map[by] == 0);
-#endif
-    assert(0);
-  }
-  void get(int by) {
-    if (ref == 0)
-      first_get();
-    ref++;
-#ifdef MDS_REF_SET
-    if (ref_map.find(by) == ref_map.end())
-      ref_map[by] = 0;
-    ref_map[by]++;
-#endif
-  }
-
-  void print_pin_set(std::ostream& out) const {
-#ifdef MDS_REF_SET
-    std::map<int, int>::const_iterator it = ref_map.begin();
-    while (it != ref_map.end()) {
-      out << " " << pin_name(it->first) << "=" << it->second;
-      ++it;
-    }
-#else
-    out << " nref=" << ref;
-#endif
-  }
-
-  protected:
-  int auth_pins;
-  int nested_auth_pins;
-#ifdef MDS_AUTHPIN_SET
-  multiset<void*> auth_pin_set;
-#endif
-
-  public:
-  bool is_auth_pinned() const { return auth_pins || nested_auth_pins; }
-  int get_num_auth_pins() const { return auth_pins; }
-  int get_num_nested_auth_pins() const { return nested_auth_pins; }
-
-  void dump_states(Formatter *f) const;
-  void dump(Formatter *f) const;
-
-  // --------------------------------------------
-  // auth pins
-  virtual bool can_auth_pin() const = 0;
-  virtual void auth_pin(void *who) = 0;
-  virtual void auth_unpin(void *who) = 0;
-  virtual bool is_frozen() const = 0;
-  virtual bool is_freezing() const = 0;
-  virtual bool is_freezing_or_frozen() const {
-    return is_frozen() || is_freezing();
-  }
-
-
-  // --------------------------------------------
-  // replication (across mds cluster)
- protected:
-  unsigned		replica_nonce; // [replica] defined on replica
-  compact_map<mds_rank_t,unsigned>	replica_map;   // [auth] mds -> nonce
-
- public:
-  bool is_replicated() const { return !replica_map.empty(); }
-  bool is_replica(mds_rank_t mds) const { return replica_map.count(mds); }
-  int num_replicas() const { return replica_map.size(); }
-  unsigned add_replica(mds_rank_t mds) {
-    if (replica_map.count(mds)) 
-      return ++replica_map[mds];  // inc nonce
-    if (replica_map.empty()) 
-      get(PIN_REPLICATED);
-    return replica_map[mds] = 1;
-  }
-  void add_replica(mds_rank_t mds, unsigned nonce) {
-    if (replica_map.empty()) 
-      get(PIN_REPLICATED);
-    replica_map[mds] = nonce;
-  }
-  unsigned get_replica_nonce(mds_rank_t mds) {
-    assert(replica_map.count(mds));
-    return replica_map[mds];
-  }
-  void remove_replica(mds_rank_t mds) {
-    assert(replica_map.count(mds));
-    replica_map.erase(mds);
-    if (replica_map.empty())
-      put(PIN_REPLICATED);
-  }
-  void clear_replica_map() {
-    if (!replica_map.empty())
-      put(PIN_REPLICATED);
-    replica_map.clear();
-  }
-  compact_map<mds_rank_t,unsigned>::iterator replicas_begin() { return replica_map.begin(); }
-  compact_map<mds_rank_t,unsigned>::iterator replicas_end() { return replica_map.end(); }
-  const compact_map<mds_rank_t,unsigned>& get_replicas() const { return replica_map; }
-  void list_replicas(std::set<mds_rank_t>& ls) const {
-    for (compact_map<mds_rank_t,unsigned>::const_iterator p = replica_map.begin();
-	 p != replica_map.end();
-	 ++p)
-      ls.insert(p->first);
-  }
-
-  unsigned get_replica_nonce() const { return replica_nonce; }
-  void set_replica_nonce(unsigned n) { replica_nonce = n; }
-
-
-  // ---------------------------------------------
-  // waiting
- protected:
-  compact_multimap<uint64_t, pair<uint64_t, MDSInternalContextBase*> > waiting;
-  static uint64_t last_wait_seq;
-
- public:
-  bool is_waiter_for(uint64_t mask, uint64_t min=0) {
-    if (!min) {
-      min = mask;
-      while (min & (min-1))  // if more than one bit is set
-	min &= min-1;        //  clear LSB
-    }
-    for (auto p = waiting.lower_bound(min);
-	 p != waiting.end();
-	 ++p) {
-      if (p->first & mask) return true;
-      if (p->first > mask) return false;
-    }
-    return false;
-  }
-  virtual void add_waiter(uint64_t mask, MDSInternalContextBase *c) {
-    if (waiting.empty())
-      get(PIN_WAITER);
-
-    uint64_t seq = 0;
-    if (mask & WAIT_ORDERED) {
-      seq = ++last_wait_seq;
-      mask &= ~WAIT_ORDERED;
-    }
-    waiting.insert(pair<uint64_t, pair<uint64_t, MDSInternalContextBase*> >(
-			    mask,
-			    pair<uint64_t, MDSInternalContextBase*>(seq, c)));
-//    pdout(10,g_conf->debug_mds) << (mdsco_db_line_prefix(this)) 
-//			       << "add_waiter " << hex << mask << dec << " " << c
-//			       << " on " << *this
-//			       << dendl;
-    
-  }
-  virtual void take_waiting(uint64_t mask, list<MDSInternalContextBase*>& ls) {
-    if (waiting.empty()) return;
-
-    // process ordered waiters in the same order that they were added.
-    std::map<uint64_t, MDSInternalContextBase*> ordered_waiters;
-
-    for (auto it = waiting.begin();
-	 it != waiting.end(); ) {
-      if (it->first & mask) {
-
-	if (it->second.first > 0)
-	  ordered_waiters.insert(it->second);
-	else
-	  ls.push_back(it->second.second);
-//	pdout(10,g_conf->debug_mds) << (mdsco_db_line_prefix(this))
-//				   << "take_waiting mask " << hex << mask << dec << " took " << it->second
-//				   << " tag " << hex << it->first << dec
-//				   << " on " << *this
-//				   << dendl;
-	waiting.erase(it++);
-      } else {
-//	pdout(10,g_conf->debug_mds) << "take_waiting mask " << hex << mask << dec << " SKIPPING " << it->second
-//				   << " tag " << hex << it->first << dec
-//				   << " on " << *this 
-//				   << dendl;
-	++it;
-      }
-    }
-    for (auto it = ordered_waiters.begin();
-	 it != ordered_waiters.end();
-	 ++it) {
-      ls.push_back(it->second);
-    }
-    if (waiting.empty())
-      put(PIN_WAITER);
-  }
-  void finish_waiting(uint64_t mask, int result = 0) {
-    list<MDSInternalContextBase*> finished;
-    take_waiting(mask, finished);
-    finish_contexts(g_ceph_context, finished, result);
-  }
-
-
-  // ---------------------------------------------
-  // locking
-  // noop unless overloaded.
-  virtual SimpleLock* get_lock(int type) { assert(0); return 0; }
-  virtual void set_object_info(MDSCacheObjectInfo &info) { assert(0); }
-  virtual void encode_lock_state(int type, bufferlist& bl) { assert(0); }
-  virtual void decode_lock_state(int type, bufferlist& bl) { assert(0); }
-  virtual void finish_lock_waiters(int type, uint64_t mask, int r=0) { assert(0); }
-  virtual void add_lock_waiter(int type, uint64_t mask, MDSInternalContextBase *c) { assert(0); }
-  virtual bool is_lock_waiting(int type, uint64_t mask) { assert(0); return false; }
-
-  virtual void clear_dirty_scattered(int type) { assert(0); }
-
-  // ---------------------------------------------
-  // ordering
-  virtual bool is_lt(const MDSCacheObject *r) const = 0;
-  struct ptr_lt {
-    bool operator()(const MDSCacheObject* l, const MDSCacheObject* r) const {
-      return l->is_lt(r);
-    }
-  };
-
-};
-
-inline std::ostream& operator<<(std::ostream& out, MDSCacheObject &o) {
-  o.print(out);
-  return out;
-}
-
-inline std::ostream& operator<<(std::ostream& out, const MDSCacheObjectInfo &info) {
-  if (info.ino) return out << info.ino << "." << info.snapid;
-  if (info.dname.length()) return out << info.dirfrag << "/" << info.dname
-				      << " snap " << info.snapid;
-  return out << info.dirfrag;
-}
-
-inline std::ostream& operator<<(std::ostream& out, mdsco_db_line_prefix o) {
-  o.object->print_db_line_prefix(out);
-  return out;
-}
 
 // parse a map of keys/values.
 namespace qi = boost::spirit::qi;

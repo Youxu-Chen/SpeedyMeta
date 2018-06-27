@@ -148,7 +148,7 @@ class frag_t {
   }
 };
 
-inline std::ostream& operator<<(std::ostream& out, frag_t hb)
+inline std::ostream& operator<<(std::ostream& out, const frag_t& hb)
 {
   //out << std::hex << hb.value() << std::dec << "/" << hb.bits() << '=';
   unsigned num = hb.bits();
@@ -160,10 +160,10 @@ inline std::ostream& operator<<(std::ostream& out, frag_t hb)
   return out << '*';
 }
 
-inline void encode(frag_t f, bufferlist& bl) { encode_raw(f._enc, bl); }
-inline void decode(frag_t &f, bufferlist::iterator& p) { 
+inline void encode(const frag_t &f, bufferlist& bl) { encode_raw(f._enc, bl); }
+inline void decode(frag_t &f, bufferlist::iterator& p) {
   __u32 v;
-  decode_raw(v, p); 
+  decode_raw(v, p);
   f._enc = v;
 }
 

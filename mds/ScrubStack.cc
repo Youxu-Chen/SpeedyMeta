@@ -20,6 +20,7 @@
 #include "mds/MDCache.h"
 #include "mds/MDSContinuation.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, scrubstack->mdcache->mds)
@@ -58,7 +59,7 @@ void ScrubStack::pop_inode(CInode *in)
 }
 
 void ScrubStack::_enqueue_inode(CInode *in, CDentry *parent,
-				const ScrubHeaderRefConst& header,
+				ScrubHeaderRef& header,
 				MDSInternalContextBase *on_finish, bool top)
 {
   dout(10) << __func__ << " with {" << *in << "}"
@@ -71,7 +72,7 @@ void ScrubStack::_enqueue_inode(CInode *in, CDentry *parent,
     push_inode_bottom(in);
 }
 
-void ScrubStack::enqueue_inode(CInode *in, const ScrubHeaderRefConst& header,
+void ScrubStack::enqueue_inode(CInode *in, ScrubHeaderRef& header,
                                MDSInternalContextBase *on_finish, bool top)
 {
   _enqueue_inode(in, NULL, header, on_finish, top);
@@ -133,9 +134,10 @@ void ScrubStack::scrub_dir_inode(CInode *in,
   bool all_frags_terminal = true;
   bool all_frags_done = true;
 
-  const ScrubHeaderRefConst& header = in->scrub_info()->header;
+  ScrubHeaderRef header = in->get_scrub_header();
+  assert(header != nullptr);
 
-  if (header->recursive) {
+  if (header->get_recursive()) {
     list<frag_t> scrubbing_frags;
     list<CDir*> scrubbing_cdirs;
     in->scrub_dirfrags_scrubbing(&scrubbing_frags);
@@ -207,7 +209,7 @@ void ScrubStack::scrub_dir_inode(CInode *in,
 
     // OK, so now I can... fire off a validate on the dir inode, and
     // when it completes, come through here again, noticing that we've
-    // set a flag to indicate the the validate happened, and 
+    // set a flag to indicate the validate happened, and 
     scrub_dir_inode_final(in);
   }
 
@@ -255,7 +257,7 @@ class C_InodeValidated : public MDSInternalContext
       : MDSInternalContext(mds), stack(stack_), target(target_)
     {}
 
-    void finish(int r)
+    void finish(int r) override
     {
       stack->_validate_inode_done(target, r, result);
     }
@@ -288,7 +290,7 @@ void ScrubStack::scrub_dir_inode_final(CInode *in)
 }
 
 void ScrubStack::scrub_dirfrag(CDir *dir,
-			       const ScrubHeaderRefConst& header,
+			       ScrubHeaderRef& header,
 			       bool *added_children, bool *is_terminal,
 			       bool *done)
 {
@@ -345,18 +347,7 @@ void ScrubStack::scrub_dirfrag(CDir *dir,
       return;
     }
 
-    if (r < 0) {
-      // FIXME: how can I handle an error here?  I can't hold someone up
-      // forever, but I can't say "sure you're scrubbed"
-      //  -- should change scrub_dentry_next definition to never
-      //  give out IO errors (handle them some other way)
-      //     
-      derr << __func__ << " error from scrub_dentry_next: "
-           << r << dendl;
-      return;
-    }
-
-    // scrub_dentry_next defined to only give -ve, EAGAIN, ENOENT, 0 -- we should
+    // scrub_dentry_next defined to only give EAGAIN, ENOENT, 0 -- we should
     // never get random IO errors here.
     assert(r == 0);
 
@@ -377,26 +368,64 @@ void ScrubStack::scrub_file_inode(CInode *in)
 void ScrubStack::_validate_inode_done(CInode *in, int r,
 				      const CInode::validated_data &result)
 {
-  // FIXME: do something real with result!  DamageTable!  Spamming
-  // the cluster log for debugging purposes
   LogChannelRef clog = mdcache->mds->clog;
-  clog->info() << __func__ << " " << *in << " r=" << r;
-#if 0
-  assert(in->scrub_infop != NULL);
-  in->scrub_infop->inode_validated = true;
-#endif
   const ScrubHeaderRefConst header = in->scrub_info()->header;
+
+  std::string path;
+  if (!result.passed_validation) {
+    // Build path string for use in messages
+    in->make_path_string(path, true);
+  }
+
+  if (result.backtrace.checked && !result.backtrace.passed
+      && !result.backtrace.repaired)
+  {
+    // Record backtrace fails as remote linkage damage, as
+    // we may not be able to resolve hard links to this inode
+    mdcache->mds->damage_table.notify_remote_damaged(in->inode.ino, path);
+  } else if (result.inode.checked && !result.inode.passed) {
+    // Record damaged inode structures as damaged dentries as
+    // that is where they are stored
+    auto parent = in->get_projected_parent_dn();
+    if (parent) {
+      auto dir = parent->get_dir();
+      mdcache->mds->damage_table.notify_dentry(
+          dir->inode->ino(), dir->frag, parent->last, parent->get_name(), path);
+    }
+  }
+
+  // Inform the cluster log if we found an error
+  if (!result.passed_validation) {
+    if (result.all_damage_repaired()) {
+      clog->info() << "Scrub repaired inode " << in->ino()
+                   << " (" << path << ")";
+    } else {
+      clog->warn() << "Scrub error on inode " << in->ino()
+                   << " (" << path << ") see " << g_conf->name
+                   << " log and `damage ls` output for details";
+    }
+
+    // Put the verbose JSON output into the MDS log for later inspection
+    JSONFormatter f;
+    result.dump(&f);
+    std::ostringstream out;
+    f.flush(out);
+    derr << __func__ << " scrub error on inode " << *in << ": " << out.str()
+         << dendl;
+  } else {
+    dout(10) << __func__ << " scrub passed on inode " << *in << dendl;
+  }
 
   MDSInternalContextBase *c = NULL;
   in->scrub_finished(&c);
 
-  if (!header->recursive && in == header->origin) {
+  if (!header->get_recursive() && in == header->get_origin()) {
     if (r >= 0) { // we got into the scrubbing dump it
-      result.dump(header->formatter);
+      result.dump(&(header->get_formatter()));
     } else { // we failed the lookup or something; dump ourselves
-      header->formatter->open_object_section("results");
-      header->formatter->dump_int("return_code", r);
-      header->formatter->close_section(); // results
+      header->get_formatter().open_object_section("results");
+      header->get_formatter().dump_int("return_code", r);
+      header->get_formatter().close_section(); // results
     }
   }
   if (c) {

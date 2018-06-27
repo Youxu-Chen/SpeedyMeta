@@ -16,6 +16,8 @@
 #ifndef DAMAGE_TABLE_H_
 #define DAMAGE_TABLE_H_
 
+#include <boost/utility/string_view.hpp>
+
 #include "mdstypes.h"
 #include "auth/Crypto.h"
 
@@ -37,10 +39,14 @@ class DamageEntry
   damage_entry_id_t id;
   utime_t reported_at;
 
+  // path is optional, advisory.  Used to give the admin an idea of what
+  // part of his tree the damage affects.
+  std::string path;
+
   DamageEntry()
   {
     id = get_random(0, 0xffffffff);
-    reported_at = ceph_clock_now(g_ceph_context);
+    reported_at = ceph_clock_now();
   }
 
   virtual damage_entry_type_t get_type() const = 0;
@@ -53,101 +59,6 @@ class DamageEntry
 
 typedef ceph::shared_ptr<DamageEntry> DamageEntryRef;
 
-/**
- * Record damage to a particular dirfrag, implicitly affecting
- * any dentries within it.
- */
-class DirFragDamage : public DamageEntry
-{
-  public:
-  inodeno_t ino;
-  frag_t frag;
-
-  DirFragDamage(inodeno_t ino_, frag_t frag_)
-    : ino(ino_), frag(frag_)
-  {}
-
-  virtual damage_entry_type_t get_type() const
-  {
-    return DAMAGE_ENTRY_DIRFRAG;
-  }
-
-  void dump(Formatter *f) const
-  {
-    f->open_object_section("dir_frag_damage");
-    f->dump_string("damage_type", "dir_frag");
-    f->dump_int("id", id);
-    f->dump_int("ino", ino);
-    f->dump_stream("frag") << frag;
-    f->close_section();
-  }
-};
-
-
-/**
- * Record damage to a particular dname within a particular dirfrag
- */
-class DentryDamage : public DamageEntry
-{
-  public:
-  inodeno_t ino;
-  frag_t frag;
-  std::string dname;
-  snapid_t snap_id;
-
-  DentryDamage(
-      inodeno_t ino_,
-      frag_t frag_,
-      std::string dname_,
-      snapid_t snap_id_)
-    : ino(ino_), frag(frag_), dname(dname_), snap_id(snap_id_)
-  {}
-
-  virtual damage_entry_type_t get_type() const
-  {
-    return DAMAGE_ENTRY_DENTRY;
-  }
-
-  void dump(Formatter *f) const
-  {
-    f->open_object_section("dentry_damage");
-    f->dump_string("damage_type", "dentry");
-    f->dump_int("id", id);
-    f->dump_int("ino", ino);
-    f->dump_stream("frag") << frag;
-    f->dump_string("dname", dname);
-    f->dump_stream("snap_id") << snap_id;
-    f->close_section();
-  }
-};
-
-
-/**
- * Record damage to our ability to look up an ino by number
- */
-class BacktraceDamage : public DamageEntry
-{
-  public:
-  inodeno_t ino;
-
-  BacktraceDamage(inodeno_t ino_)
-    : ino(ino_)
-  {}
-
-  virtual damage_entry_type_t get_type() const
-  {
-    return DAMAGE_ENTRY_BACKTRACE;
-  }
-
-  void dump(Formatter *f) const
-  {
-    f->open_object_section("backtrace_damage");
-    f->dump_string("damage_type", "backtrace");
-    f->dump_int("id", id);
-    f->dump_int("ino", ino);
-    f->close_section();
-  }
-};
 
 class DirFragIdent
 {
@@ -184,7 +95,7 @@ class DentryIdent
     }
   }
 
-  DentryIdent(const std::string &dname_, snapid_t snap_id_)
+  DentryIdent(boost::string_view dname_, snapid_t snap_id_)
     : dname(dname_), snap_id(snap_id_)
   {}
 };
@@ -252,7 +163,7 @@ public:
    *
    * @return true if fatal
    */
-  bool notify_dirfrag(inodeno_t ino, frag_t frag);
+  bool notify_dirfrag(inodeno_t ino, frag_t frag, boost::string_view path);
 
   /**
    * Indicate that a particular dentry cannot be loaded.
@@ -261,17 +172,17 @@ public:
    */
   bool notify_dentry(
     inodeno_t ino, frag_t frag,
-    snapid_t snap_id, const std::string &dname);
+    snapid_t snap_id, boost::string_view dname, boost::string_view path);
 
   /**
    * Indicate that a particular Inode could not be loaded by number
    */
   bool notify_remote_damaged(
-      inodeno_t ino);
+      inodeno_t ino, boost::string_view path);
 
   bool is_dentry_damaged(
       const CDir *dir_frag,
-      const std::string &dname,
+      boost::string_view dname,
       const snapid_t snap_id) const;
 
   bool is_dirfrag_damaged(

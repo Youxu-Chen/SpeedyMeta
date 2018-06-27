@@ -19,6 +19,8 @@
 
 int64_t unit_to_bytesize(string val, ostream *pss);
 
+std::string bytes2str(uint64_t count);
+
 struct ceph_data_stats
 {
   uint64_t byte_total;
@@ -69,6 +71,7 @@ struct ceph_data_stats
   }
 };
 typedef struct ceph_data_stats ceph_data_stats_t;
+WRITE_CLASS_ENCODER(ceph_data_stats)
 
 int get_fs_stats(ceph_data_stats_t &stats, const char *path);
 

@@ -15,6 +15,7 @@
 
 #include "common/dout.h"
 #include "common/HeartbeatMap.h"
+
 #include "include/stringify.h"
 #include "include/util.h"
 
@@ -27,19 +28,19 @@
 
 #include "Beacon.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds.beacon." << name << ' '
 
 
-Beacon::Beacon(CephContext *cct_, MonClient *monc_, std::string name_) :
+Beacon::Beacon(CephContext *cct_, MonClient *monc_, boost::string_view name_) :
   Dispatcher(cct_), lock("Beacon"), monc(monc_), timer(g_ceph_context, lock),
   name(name_), standby_for_rank(MDS_RANK_NONE),
   standby_for_fscid(FS_CLUSTER_ID_NONE), want_state(MDSMap::STATE_BOOT),
   awaiting_seq(-1)
 {
   last_seq = 0;
-  sender = NULL;
   was_laggy = false;
 
   epoch = 0;
@@ -106,7 +107,7 @@ void Beacon::handle_mds_beacon(MMDSBeacon *m)
 
   // update lab
   if (seq_stamp.count(seq)) {
-    utime_t now = ceph_clock_now(g_ceph_context);
+    utime_t now = ceph_clock_now();
     if (seq_stamp[seq] > last_acked_stamp) {
       last_acked_stamp = seq_stamp[seq];
       utime_t rtt = now - last_acked_stamp;
@@ -160,9 +161,9 @@ void Beacon::send_and_wait(const double duration)
            << " for up to " << duration << "s" << dendl;
 
   utime_t timeout;
-  timeout.set_from_double(ceph_clock_now(cct) + duration);
+  timeout.set_from_double(ceph_clock_now() + duration);
   while ((!seq_stamp.empty() && seq_stamp.begin()->first <= awaiting_seq)
-         && ceph_clock_now(cct) < timeout) {
+         && ceph_clock_now() < timeout) {
     waiting_cond.WaitUntil(lock, timeout);
   }
 
@@ -178,8 +179,13 @@ void Beacon::_send()
   if (sender) {
     timer.cancel_event(sender);
   }
-  sender = new C_MDS_BeaconSender(this);
-  timer.add_event_after(g_conf->mds_beacon_interval, sender);
+  sender = timer.add_event_after(
+    g_conf->mds_beacon_interval,
+    new FunctionContext([this](int) {
+	assert(lock.is_locked_by_me());
+	sender = nullptr;
+	_send();
+      }));
 
   if (!cct->get_heartbeat_map()->is_healthy()) {
     /* If anything isn't progressing, let avoid sending a beacon so that
@@ -193,7 +199,7 @@ void Beacon::_send()
 	   << " seq " << last_seq
 	   << dendl;
 
-  seq_stamp[last_seq] = ceph_clock_now(g_ceph_context);
+  seq_stamp[last_seq] = ceph_clock_now();
 
   assert(want_state != MDSMap::STATE_NULL);
   
@@ -215,6 +221,7 @@ void Beacon::_send()
   if (want_state == MDSMap::STATE_BOOT) {
     map<string, string> sys_info;
     collect_sys_info(&sys_info, cct);
+    sys_info["addr"] = stringify(monc->get_myaddr());
     beacon->set_sys_info(sys_info);
   }
   monc->send_mon_message(beacon);
@@ -251,7 +258,7 @@ bool Beacon::is_laggy()
   if (last_acked_stamp == utime_t())
     return false;
 
-  utime_t now = ceph_clock_now(g_ceph_context);
+  utime_t now = ceph_clock_now();
   utime_t since = now - last_acked_stamp;
   if (since > g_conf->mds_beacon_grace) {
     dout(5) << "is_laggy " << since << " > " << g_conf->mds_beacon_grace
@@ -385,7 +392,7 @@ void Beacon::notify_health(MDSRank const *mds)
     set<Session*> sessions;
     mds->sessionmap.get_client_session_set(sessions);
 
-    utime_t cutoff = ceph_clock_now(g_ceph_context);
+    utime_t cutoff = ceph_clock_now();
     cutoff -= g_conf->mds_recall_state_timeout;
     utime_t last_recall = mds->mdcache->last_recall_state;
 
@@ -448,10 +455,35 @@ void Beacon::notify_health(MDSRank const *mds)
     }
   }
 
+  // Detect MDS_HEALTH_SLOW_REQUEST condition
+  {
+    int slow = mds->get_mds_slow_req_count();
+    dout(20) << slow << " slow request found" << dendl;
+    if (slow) {
+      std::ostringstream oss;
+      oss << slow << " slow requests are blocked > " << g_conf->mds_op_complaint_time << " sec";
+
+      MDSHealthMetric m(MDS_HEALTH_SLOW_REQUEST, HEALTH_WARN, oss.str());
+      health.metrics.push_back(m);
+    }
+  }
+
   // Report a health warning if we are readonly
   if (mds->mdcache->is_readonly()) {
     MDSHealthMetric m(MDS_HEALTH_READ_ONLY, HEALTH_WARN,
                       "MDS in read-only mode");
+    health.metrics.push_back(m);
+  }
+
+  // Report if we have significantly exceeded our cache size limit
+  if (mds->mdcache->cache_overfull()) {
+    std::ostringstream oss;
+    oss << "MDS cache is too large (" << bytes2str(mds->mdcache->cache_size())
+        << "/" << bytes2str(mds->mdcache->cache_limit_memory()) << "); "
+        << mds->mdcache->num_inodes_with_caps << " inodes in use by clients, "
+        << mds->mdcache->get_num_strays() << " stray files";
+
+    MDSHealthMetric m(MDS_HEALTH_CACHE_OVERSIZED, HEALTH_WARN, oss.str());
     health.metrics.push_back(m);
   }
 }

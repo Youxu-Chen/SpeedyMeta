@@ -3,7 +3,6 @@
 
 #include <list>
 #include <set>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -96,7 +95,7 @@ static inline std::vector<std::string> get_str_vec(const std::string& str)
   std::vector<std::string> str_vec;
   const char *delims = ";,= \t";
   get_str_vec(str, delims, str_vec);
-  return std::move(str_vec);
+  return str_vec;
 }
 
 #endif

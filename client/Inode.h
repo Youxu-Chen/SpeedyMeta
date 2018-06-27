@@ -4,9 +4,10 @@
 #ifndef CEPH_CLIENT_INODE_H
 #define CEPH_CLIENT_INODE_H
 
+#include <numeric>
+
 #include "include/types.h"
 #include "include/xlist.h"
-#include "include/filepath.h"
 
 #include "mds/mdstypes.h" // hrm
 
@@ -14,6 +15,8 @@
 #include "include/assert.h"
 
 #include "InodeRef.h"
+#include "UserPerm.h"
+#include "Delegation.h"
 
 class Client;
 struct MetaSession;
@@ -23,7 +26,8 @@ struct SnapRealm;
 struct Inode;
 class ceph_lock_state_t;
 class MetaRequest;
-class UserGroups;
+class filepath;
+class Fh;
 
 struct Cap {
   MetaSession *session;
@@ -37,9 +41,11 @@ struct Cap {
   uint64_t seq, issue_seq;
   __u32 mseq;  // migration seq
   __u32 gen;
+  UserPerm latest_perms;
 
   Cap() : session(NULL), inode(NULL), cap_item(this), cap_id(0), issued(0),
-	       implemented(0), wanted(0), seq(0), issue_seq(0), mseq(0), gen(0) {}
+	  implemented(0), wanted(0), seq(0), issue_seq(0), mseq(0), gen(0),
+	  latest_perms()  {}
 
   void dump(Formatter *f) const;
 };
@@ -51,8 +57,9 @@ struct CapSnap {
   int issued, dirty;
 
   uint64_t size;
-  utime_t ctime, mtime, atime;
+  utime_t ctime, btime, mtime, atime;
   version_t time_warp_seq;
+  uint64_t change_attr;
   uint32_t   mode;
   uid_t      uid;
   gid_t      gid;
@@ -66,9 +73,9 @@ struct CapSnap {
   uint64_t flush_tid;
 
   explicit CapSnap(Inode *i)
-    : in(i), issued(0), dirty(0),
-      size(0), time_warp_seq(0), mode(0), uid(0), gid(0), xattr_version(0),
-      inline_version(0), writing(false), dirty_data(false), flush_tid(0)
+    : in(i), issued(0), dirty(0), size(0), time_warp_seq(0), change_attr(0),
+      mode(0), uid(0), gid(0), xattr_version(0), inline_version(0),
+      writing(false), dirty_data(false), flush_tid(0)
   {}
 
   void dump(Formatter *f) const;
@@ -77,18 +84,20 @@ struct CapSnap {
 // inode flags
 #define I_COMPLETE	1
 #define I_DIR_ORDERED	2
+#define I_CAP_DROPPED	4
 #define I_SNAPDIR_OPEN	8
 
 struct Inode {
-  // corefs
-  bool prefetched;
+  // speedymeta
+  uint32_t times_phd;
+  uint32_t period_times_phd;
   bool accessed;
-  int times_phd;
-  int period_times_phd;
+  bool prefetched;
 
   Client *client;
+
   // -- the actual inode --
-  inodeno_t ino;
+  inodeno_t ino; // ORDER DEPENDENCY: oset
   snapid_t  snapid;
   ino_t faked_ino;
 
@@ -96,6 +105,7 @@ struct Inode {
 
   // affected by any inode change...
   utime_t    ctime;   // inode change time
+  utime_t    btime;   // birth time
 
   // perm (namespace permissions)
   uint32_t   mode;
@@ -114,6 +124,7 @@ struct Inode {
   utime_t    mtime;   // file data modify time.
   utime_t    atime;   // file data access time.
   uint32_t   time_warp_seq;  // count of (potential) mtime/atime timewarps (i.e., utimes())
+  uint64_t   change_attr;
 
   uint64_t max_size;  // max size we can write to
 
@@ -142,6 +153,7 @@ struct Inode {
     int which = dir_layout.dl_dir_hash;
     if (!which)
       which = CEPH_STR_HASH_LINUX;
+    assert(ceph_str_hash_valid(which));
     return ceph_str_hash(which, dn.data(), dn.length());
   }
 
@@ -176,13 +188,13 @@ struct Inode {
   SnapRealm *snaprealm;
   xlist<Inode*>::item snaprealm_item;
   InodeRef snapdir_parent;  // only if we are a snapdir inode
-  map<snapid_t,CapSnap*> cap_snaps;   // pending flush to mds
+  map<snapid_t,CapSnap> cap_snaps;   // pending flush to mds
 
   //int open_by_mode[CEPH_FILE_MODE_NUM];
   map<int,int> open_by_mode;
   map<int,int> cap_refs;
 
-  ObjectCacher::ObjectSet oset;
+  ObjectCacher::ObjectSet oset; // ORDER DEPENDENCY: ino
 
   uint64_t     reported_size, wanted_max_size, requested_max_size;
 
@@ -195,19 +207,7 @@ struct Inode {
 
   list<Cond*>       waitfor_caps;
   list<Cond*>       waitfor_commit;
-
-  //Cor-FS
-  //string cor_file;  //filename of data-correlated
-
-  // void set_cor_files(string s){
-  //   cor_file = s;
-  //   return;
-  // }
-
-  // string get_cor_files(){
-  //   return cor_file;
-  // }
-  //Cor-FS
+  list<Cond*>	    waitfor_deleg;
 
   Dentry *get_first_parent() {
     assert(!dn_set.empty());
@@ -236,9 +236,33 @@ struct Inode {
   ceph_lock_state_t *fcntl_locks;
   ceph_lock_state_t *flock_locks;
 
+  list<Delegation> delegations;
+
   xlist<MetaRequest*> unsafe_ops;
 
-  Inode(Client *c, vinodeno_t vino, file_layout_t *newlayout);
+  std::set<Fh*> fhs;
+
+  Inode(Client *c, vinodeno_t vino, file_layout_t *newlayout)
+    : times_phd(0), period_times_phd(0), accessed(false), prefetched(false),client(c), ino(vino.ino), snapid(vino.snapid), faked_ino(0),
+      rdev(0), mode(0), uid(0), gid(0), nlink(0),
+      size(0), truncate_seq(1), truncate_size(-1),
+      time_warp_seq(0), change_attr(0), max_size(0), version(0),
+      xattr_version(0), inline_version(0), flags(0),
+      dir(0), dir_release_count(1), dir_ordered_count(1),
+      dir_hashed(false), dir_replicated(false), auth_cap(NULL),
+      cap_dirtier_uid(-1), cap_dirtier_gid(-1),
+      dirty_caps(0), flushing_caps(0), shared_gen(0), cache_gen(0),
+      snap_caps(0), snap_cap_refs(0),
+      cap_item(this), flushing_cap_item(this),
+      snaprealm(0), snaprealm_item(this),
+      oset((void *)this, newlayout->pool_id, this->ino),
+      reported_size(0), wanted_max_size(0), requested_max_size(0),
+      _ref(0), ll_ref(0), dn_set(),
+      fcntl_locks(NULL), flock_locks(NULL)
+  {
+    memset(&dir_layout, 0, sizeof(dir_layout));
+    memset(&quota, 0, sizeof(quota));
+  }
   ~Inode();
 
   vinodeno_t vino() const { return vinodeno_t(ino, snapid); }
@@ -252,7 +276,7 @@ struct Inode {
     }
   };
 
-  bool check_mode(uid_t uid, UserGroups& groups, unsigned want);
+  bool check_mode(const UserPerm& perms, unsigned want);
 
   // CAPS --------
   void get_open_ref(int mode);
@@ -265,19 +289,48 @@ struct Inode {
   int caps_issued(int *implemented = 0) const;
   void touch_cap(Cap *cap);
   void try_touch_cap(mds_rank_t mds);
-  bool caps_issued_mask(unsigned mask);
+  bool caps_issued_mask(unsigned mask, bool allow_impl=false);
   int caps_used();
   int caps_file_wanted();
   int caps_wanted();
+  int caps_mds_wanted();
   int caps_dirty();
+  const UserPerm *get_best_perms();
 
   bool have_valid_size();
   Dir *open_dir();
 
-  // Record errors to be exposed in fclose/fflush
-  int async_err;
-
+  void add_fh(Fh *f) {fhs.insert(f);}
+  void rm_fh(Fh *f) {fhs.erase(f);}
+  void set_async_err(int r);
   void dump(Formatter *f) const;
+
+  void break_all_delegs() { break_deleg(false); };
+
+  void recall_deleg(bool skip_read);
+  bool has_recalled_deleg();
+  int set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv);
+  void unset_deleg(Fh *fh);
+
+private:
+  // how many opens for write on this Inode?
+  long open_count_for_write()
+  {
+    return (long)(open_by_mode[CEPH_FILE_MODE_RDWR] +
+		  open_by_mode[CEPH_FILE_MODE_WR]);
+  };
+
+  // how many opens of any sort on this inode?
+  long open_count()
+  {
+    return (long) std::accumulate(open_by_mode.begin(), open_by_mode.end(), 0,
+				  [] (int value, const std::map<int, int>::value_type& p)
+                   { return value + p.second; });
+  };
+
+  void break_deleg(bool skip_read);
+  bool delegations_broken(bool skip_read);
+
 };
 
 ostream& operator<<(ostream &out, const Inode &in);
