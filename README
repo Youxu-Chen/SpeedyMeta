@@ -4,4 +4,4 @@ SpeedyMeta - scale metadata performance via correlation-based metadata prefetchi
 
 This original project is built on Ceph Jewel v10.2.7. Now, we have updated speedymeta on Ceph Luminous v12.2.5.
 
-In this project, we only exhibit our modification on source code of Ceph Luminous v12.2.5.
+In this project, we only exhibit our modification in source code of Ceph Luminous v12.2.5.
